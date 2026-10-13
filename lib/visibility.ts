@@ -1,7 +1,6 @@
-
 import * as Astronomy from "astronomy-engine";
 import type { Body } from "astronomy-engine";
-import {objectProfiles} from "@/lib/objectProfiles";
+import { objectProfiles } from "@/lib/objectProfiles";
 import type {
   HorizonProfile,
   ObserverLocation,
@@ -28,17 +27,20 @@ export function analyzeHorizonVisibility(
   location: ObserverLocation,
   horizon: HorizonProfile,
   date: Date = new Date(),
-  bortleClass: number = 6
+  bortleClass: number = 6,
 ): VisibilityResult {
   const position = getBodyPosition(body, location, date);
 
-  const obstructionAltitude = getHorizonAltitude(
-    position.azimuth,
-    horizon
-  );
+  const obstructionAltitude = getHorizonAltitude(position.azimuth, horizon);
 
   const aboveMathematicalHorizon = position.altitude > 0;
   const clearsObstruction = position.altitude > obstructionAltitude;
+
+  const clearance = position.altitude - obstructionAltitude;
+
+  // Clearance improves the score gradually over the first 15 degrees.
+  // This affects observing quality, not geometric visibility.
+  const clearanceFactor = 0.5 + 0.5 * clamp(clearance / 15, 0, 1);
 
   const reasons: string[] = [];
 
@@ -46,7 +48,7 @@ export function analyzeHorizonVisibility(
     reasons.push("Object is below the mathematical horizon.");
   } else if (!clearsObstruction) {
     reasons.push(
-      `Object is blocked by an obstruction reaching ${obstructionAltitude.toFixed(1)}°.`
+      `Object is blocked by an obstruction reaching ${obstructionAltitude.toFixed(1)}°.`,
     );
   } else {
     reasons.push("Object clears the modeled horizon obstruction.");
@@ -61,33 +63,32 @@ export function analyzeHorizonVisibility(
       azimuth: position.azimuth,
     };
   }
-
+  if (clearsObstruction && clearance < 5) {
+    reasons.push(
+      "The object only narrowly clears the modeled horizon; nearby obstructions or atmospheric effects may interfere.",
+    );
+  }
   const bodyName = Astronomy.Body[body];
 
-const profile =
-  objectProfiles[bodyName] ?? objectProfiles.stars;
+  const profile = objectProfiles[bodyName] ?? objectProfiles.stars;
 
-const altitudeFactor = clamp(
-  (position.altitude - profile.minimumUsefulAltitude) /
-    Math.max(30 - profile.minimumUsefulAltitude, 1),
-  0,
-  1
-);
+  const altitudeFactor = clamp(
+    (position.altitude - profile.minimumUsefulAltitude) /
+      Math.max(30 - profile.minimumUsefulAltitude, 1),
+    0,
+    1,
+  );
 
   let darknessFactor = 1;
 
   if (body !== Astronomy.Body.Sun) {
-    const sunPosition = getBodyPosition(
-      Astronomy.Body.Sun,
-      location,
-      date
-    );
+    const sunPosition = getBodyPosition(Astronomy.Body.Sun, location, date);
 
     darknessFactor = getDarknessFactor(sunPosition.altitude);
 
     if (sunPosition.altitude >= 0) {
       reasons.push(
-        "The Sun is above the horizon; daylight may hinder observing."
+        "The Sun is above the horizon; daylight may hinder observing.",
       );
     } else if (sunPosition.altitude > -18) {
       reasons.push("Twilight may reduce visibility.");
@@ -98,42 +99,38 @@ const altitudeFactor = clamp(
 
   if (position.altitude < 10) {
     reasons.push(
-      "The object is low in the sky; atmospheric effects may reduce clarity."
+      "The object is low in the sky; atmospheric effects may reduce clarity.",
     );
   }
 
-  const baseLightPollutionFactor =
-  getLightPollutionFactor({ bortleClass });
+  const baseLightPollutionFactor = getLightPollutionFactor({ bortleClass });
 
-const lightPollutionFactor =
-  body === Astronomy.Body.Sun
-    ? 1
-    : 1 -
-      (1 - baseLightPollutionFactor) *
-        profile.lightPollutionSensitivity;
+  const lightPollutionFactor =
+    body === Astronomy.Body.Sun
+      ? 1
+      : 1 - (1 - baseLightPollutionFactor) * profile.lightPollutionSensitivity;
 
   if (body !== Astronomy.Body.Sun) {
-    reasons.push(
-      `Light-pollution adjustment: Bortle class ${bortleClass}.`
-    );
+    reasons.push(`Light-pollution adjustment: Bortle class ${bortleClass}.`);
   }
 
   const score = Math.round(
     100 *
       altitudeFactor *
       darknessFactor *
-      lightPollutionFactor
+      lightPollutionFactor *
+      clearanceFactor,
   );
 
   if (score >= 70) {
     reasons.push(
-      "Estimated conditions are favorable based on altitude, darkness, and light pollution."
+      "Estimated conditions are favorable based on altitude, darkness, and light pollution.",
     );
   } else if (score >= 35) {
     reasons.push("Estimated observing conditions are moderate.");
   } else {
     reasons.push(
-      "Estimated observing conditions are poor based on altitude, darkness, and light pollution."
+      "Estimated observing conditions are poor based on altitude, darkness, and light pollution.",
     );
   }
 
