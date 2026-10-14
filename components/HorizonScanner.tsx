@@ -21,6 +21,29 @@ const BIN_COUNT = 24;
 const BIN_SIZE = 360 / BIN_COUNT;
 const IMAGE_WIDTH = 640;
 const IMAGE_HEIGHT = 360;
+const GUIDED_SECTOR_SIZE = 45;
+
+const GUIDED_DIRECTIONS = [
+  "North",
+  "Northeast",
+  "East",
+  "Southeast",
+  "South",
+  "Southwest",
+  "West",
+  "Northwest",
+] as const;
+
+const SHORT_DIRECTIONS = [
+  "N",
+  "NE",
+  "E",
+  "SE",
+  "S",
+  "SW",
+  "W",
+  "NW",
+] as const;
 
 function normalizeAzimuth(value: number): number {
   return ((value % 360) + 360) % 360;
@@ -34,6 +57,12 @@ function getBinCenter(bin: number): number {
   return normalizeAzimuth(bin * BIN_SIZE + BIN_SIZE / 2);
 }
 
+function getGuidedSector(azimuth: number): number {
+  return (
+    Math.round(normalizeAzimuth(azimuth) / GUIDED_SECTOR_SIZE) % 8
+  );
+}
+
 function getHeading(
   event: DeviceOrientationEvent
 ): {
@@ -44,7 +73,6 @@ function getHeading(
     webkitCompassHeading?: number;
   };
 
-  // iOS Safari provides a compass heading when available.
   if (
     typeof extendedEvent.webkitCompassHeading === "number" &&
     Number.isFinite(extendedEvent.webkitCompassHeading)
@@ -57,8 +85,6 @@ function getHeading(
     };
   }
 
-  // Absolute alpha can provide an approximate heading on some
-  // devices. Its accuracy and reference direction vary by browser.
   if (
     event.absolute &&
     typeof event.alpha === "number" &&
@@ -73,6 +99,15 @@ function getHeading(
   return null;
 }
 
+function isSectorCaptured(
+  sector: number,
+  capturedFrames: HorizonScanFrame[]
+): boolean {
+  return capturedFrames.some(
+    (frame) => getGuidedSector(frame.azimuth) === sector
+  );
+}
+
 export default function HorizonScanner({
   onScanComplete,
   onCancel,
@@ -83,12 +118,14 @@ export default function HorizonScanner({
   const framesRef = useRef<Map<number, HorizonScanFrame>>(
     new Map()
   );
+
   const latestOrientationRef = useRef<{
     azimuth: number;
     pitch: number | null;
     roll: number | null;
     source: "compass" | "estimated";
   } | null>(null);
+
   const onScanCompleteRef = useRef(onScanComplete);
 
   const [cameraReady, setCameraReady] = useState(false);
@@ -96,10 +133,19 @@ export default function HorizonScanner({
   const [heading, setHeading] = useState<number | null>(null);
   const [pitch, setPitch] = useState<number | null>(null);
   const [roll, setRoll] = useState<number | null>(null);
+
   const [headingSource, setHeadingSource] = useState<
     "compass" | "estimated" | null
   >(null);
+
   const [frames, setFrames] = useState<HorizonScanFrame[]>([]);
+  const [currentSector, setCurrentSector] = useState<number | null>(
+    null
+  );
+  const [selectedSector, setSelectedSector] = useState<number | null>(
+    null
+  );
+
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState(
     "Allow camera and motion access to begin."
@@ -128,7 +174,7 @@ export default function HorizonScanner({
 
     if (!navigator.mediaDevices?.getUserMedia) {
       setError(
-        "Camera access is unavailable. Open AstroLens in a supported browser over HTTPS or localhost."
+        "Camera access is unavailable. Open AstroLens using HTTPS or localhost in a supported browser."
       );
       return false;
     }
@@ -200,8 +246,7 @@ export default function HorizonScanner({
         };
 
       if (
-        typeof OrientationConstructor.requestPermission ===
-        "function"
+        typeof OrientationConstructor.requestPermission === "function"
       ) {
         const permission =
           await OrientationConstructor.requestPermission();
@@ -215,7 +260,7 @@ export default function HorizonScanner({
       }
 
       setMessage(
-        "Sensors enabled. Point toward the skyline and rotate slowly."
+        "Sensors enabled. Hold the phone upright and point toward the skyline."
       );
 
       return true;
@@ -251,9 +296,6 @@ export default function HorizonScanner({
       return;
     }
 
-    canvas.width = IMAGE_WIDTH;
-    canvas.height = IMAGE_HEIGHT;
-
     const sourceWidth = video.videoWidth;
     const sourceHeight = video.videoHeight;
 
@@ -262,7 +304,9 @@ export default function HorizonScanner({
       return;
     }
 
-    // Center-crop to a consistent landscape aspect ratio.
+    canvas.width = IMAGE_WIDTH;
+    canvas.height = IMAGE_HEIGHT;
+
     const targetRatio = IMAGE_WIDTH / IMAGE_HEIGHT;
     const sourceRatio = sourceWidth / sourceHeight;
 
@@ -293,6 +337,7 @@ export default function HorizonScanner({
 
     const imageDataUrl = canvas.toDataURL("image/jpeg", 0.7);
     const bin = getBin(orientation.azimuth);
+    const sector = getGuidedSector(orientation.azimuth);
 
     const frame: HorizonScanFrame = {
       azimuth: orientation.azimuth,
@@ -303,7 +348,8 @@ export default function HorizonScanner({
       headingSource: orientation.source,
     };
 
-    // Keep the newest frame for each 15-degree sector.
+    // Retain the newest frame for each 15-degree bin.
+    // The guided interface groups these bins into eight 45-degree sectors.
     framesRef.current.set(bin, frame);
 
     const updatedFrames = Array.from(
@@ -313,7 +359,13 @@ export default function HorizonScanner({
     setFrames(updatedFrames);
 
     setMessage(
-      `Captured sector centered near ${getBinCenter(bin)}°. Continue rotating to cover the full skyline.`
+      `${GUIDED_DIRECTIONS[sector]} captured at ${Math.round(
+        orientation.azimuth
+      )}°. ${
+        updatedFrames.length > 0
+          ? "Continue to the next missing direction."
+          : "Continue rotating slowly."
+      }`
     );
   }, []);
 
@@ -322,7 +374,7 @@ export default function HorizonScanner({
       return;
     }
 
-    let lastAutoCapturedBin: number | null = null;
+    let lastAutoCapturedSector: number | null = null;
     let lastCaptureTime = 0;
 
     const handleOrientation = (
@@ -332,13 +384,14 @@ export default function HorizonScanner({
 
       if (!result) {
         setMessage(
-          "No reliable heading is available. Check sensor permissions or capture directions manually when a heading appears."
+          "No reliable heading is available. Check sensor permissions or use manual capture when a heading appears."
         );
         return;
       }
 
       const nextPitch =
         typeof event.beta === "number" ? event.beta : null;
+
       const nextRoll =
         typeof event.gamma === "number" ? event.gamma : null;
 
@@ -354,25 +407,30 @@ export default function HorizonScanner({
       setRoll(nextRoll);
       setHeadingSource(result.source);
 
-      const currentBin = getBin(result.azimuth);
+      const sector = getGuidedSector(result.azimuth);
       const nowMs = Date.now();
 
-      // Capture automatically on entry to a new sector.
-      // A short cooldown avoids duplicate captures from noisy sensors.
+      setCurrentSector(sector);
+
+      // Capture once when entering an uncaptured 45-degree sector.
+      // The cooldown avoids duplicate captures from noisy sensors.
       if (
-        currentBin !== lastAutoCapturedBin &&
-        nowMs - lastCaptureTime > 1200
+        sector !== lastAutoCapturedSector &&
+        nowMs - lastCaptureTime > 1200 &&
+        !isSectorCaptured(
+          sector,
+          Array.from(framesRef.current.values())
+        )
       ) {
-        lastAutoCapturedBin = currentBin;
+        lastAutoCapturedSector = sector;
         lastCaptureTime = nowMs;
         captureFrame();
+      } else {
+        lastAutoCapturedSector = sector;
       }
     };
 
-    window.addEventListener(
-      "deviceorientation",
-      handleOrientation
-    );
+    window.addEventListener("deviceorientation", handleOrientation);
 
     return () => {
       window.removeEventListener(
@@ -381,51 +439,60 @@ export default function HorizonScanner({
       );
     };
   }, [scanning, captureFrame]);
-    
-const startScan = async () => {
-  setError(null);
 
-  // Initiate both permission requests from the button click.
-  // iOS Safari may reject sensor permission if requested
-  // after another asynchronous operation.
-  const sensorPromise = enableSensors();
-  const cameraPromise = startCamera();
+  const startScan = async () => {
+    setError(null);
 
-  const [sensorsEnabled, cameraStarted] = await Promise.all([
-    sensorPromise,
-    cameraPromise,
-  ]);
+    // Request both permissions directly from the user's button action.
+    const sensorPromise = enableSensors();
+    const cameraPromise = startCamera();
 
-  if (!cameraStarted || !sensorsEnabled) {
-    stopCamera();
-    return;
-  }
+    const [sensorsEnabled, cameraStarted] = await Promise.all([
+      sensorPromise,
+      cameraPromise,
+    ]);
 
-  framesRef.current.clear();
-  latestOrientationRef.current = null;
+    if (!cameraStarted || !sensorsEnabled) {
+      stopCamera();
+      return;
+    }
 
-  setFrames([]);
-  setHeading(null);
-  setPitch(null);
-  setRoll(null);
-  setHeadingSource(null);
+    framesRef.current.clear();
+    latestOrientationRef.current = null;
 
-  setMessage(
-    "Rotate slowly through all directions. Keep the skyline visible in the camera."
-  );
+    setFrames([]);
+    setHeading(null);
+    setPitch(null);
+    setRoll(null);
+    setHeadingSource(null);
+    setCurrentSector(null);
+    setSelectedSector(null);
 
-  setScanning(true);
-};
+    setMessage(
+      "Start facing north, then rotate clockwise in small, slow movements. Pause briefly in each direction."
+    );
 
+    setScanning(true);
+  };
 
   const finishScan = () => {
     const capturedFrames = Array.from(
       framesRef.current.values()
     ).sort((a, b) => a.azimuth - b.azimuth);
 
-    if (capturedFrames.length < 12) {
+    const completedCount = GUIDED_DIRECTIONS.filter(
+      (_, sector) => isSectorCaptured(sector, capturedFrames)
+    ).length;
+
+    if (completedCount < GUIDED_DIRECTIONS.length) {
+      const missing = GUIDED_DIRECTIONS.filter(
+        (_, sector) => !isSectorCaptured(sector, capturedFrames)
+      );
+
       setError(
-        "Capture at least 12 of the 24 sectors before finishing. Rotate slowly and capture missed directions."
+        `You have captured ${completedCount} of 8 directions. Missing: ${missing.join(
+          ", "
+        )}. Select a missing direction, point toward it, and capture it before finishing.`
       );
       return;
     }
@@ -439,8 +506,12 @@ const startScan = async () => {
     setScanning(false);
     stopCamera();
     framesRef.current.clear();
+    latestOrientationRef.current = null;
     setFrames([]);
+    setCurrentSector(null);
+    setSelectedSector(null);
     setError(null);
+    setMessage("Scan cancelled.");
     onCancel?.();
   };
 
@@ -452,15 +523,65 @@ const startScan = async () => {
     };
   }, []);
 
-  const coverage = Math.round(
-    (frames.length / BIN_COUNT) * 100
+  const capturedSectors = GUIDED_DIRECTIONS.map((_, sector) =>
+    isSectorCaptured(sector, frames)
   );
+
+  const capturedSectorCount = capturedSectors.filter(Boolean).length;
+
+  const coverage = Math.round(
+    (capturedSectorCount / GUIDED_DIRECTIONS.length) * 100
+  );
+
+  const nextMissingSector = capturedSectors.findIndex(
+    (captured) => !captured
+  );
+
+  const guidedTarget =
+    selectedSector !== null
+      ? selectedSector
+      : currentSector !== null && !capturedSectors[currentSector]
+        ? currentSector
+        : nextMissingSector >= 0
+          ? nextMissingSector
+          : currentSector;
+
+  const targetDirection =
+    guidedTarget === null || guidedTarget < 0
+      ? null
+      : GUIDED_DIRECTIONS[guidedTarget];
+
+  const turnInstruction = (() => {
+    if (currentSector === null) {
+      return "Hold your phone upright and wait for a compass heading.";
+    }
+
+    if (selectedSector !== null) {
+      if (currentSector === selectedSector) {
+        return `You are pointing toward ${GUIDED_DIRECTIONS[selectedSector]}. Pause and tap “Capture this direction.”`;
+      }
+
+      return `Slowly rotate toward ${GUIDED_DIRECTIONS[selectedSector]}. Tap “Capture this direction” when you are pointing that way.`;
+    }
+
+    if (capturedSectorCount === GUIDED_DIRECTIONS.length) {
+      return "All eight directions are captured. You can finish the scan.";
+    }
+
+    if (currentSector === guidedTarget) {
+      return `You are pointing toward ${GUIDED_DIRECTIONS[currentSector]}. Pause briefly so AstroLens can capture it.`;
+    }
+
+    return targetDirection
+      ? `Slowly rotate clockwise toward ${targetDirection}. Keep the skyline visible.`
+      : "Rotate slowly to review the horizon.";
+  })();
 
   return (
     <section className="space-y-4 rounded-xl border p-4 sm:p-5">
       <div>
         <p className="text-sm font-medium uppercase tracking-widest text-blue-500">
-          AstroLens · Horizon scan
+          AstroLens · Guided horizon scan
         </p>
 
         <h2 className="mt-1 text-xl font-semibold">
@@ -468,9 +589,9 @@ const startScan = async () => {
         </h2>
 
         <p className="mt-2 text-sm text-gray-600 dark:text-gray-300">
-          Capture the skyline as you rotate through 360°. For
-          the clearest obstruction detection, scan during daylight
-          with buildings, trees, and hills visible.
+          Hold your phone vertically and capture the skyline through
+          a full 360-degree rotation. Daylight scans make buildings,
+          trees, and hills easier to identify.
         </p>
       </div>
 
@@ -491,7 +612,7 @@ const startScan = async () => {
         )}
 
         {cameraReady && (
-          <div className="absolute left-3 top-3 rounded-lg bg-black/65 px-3 py-2 text-sm text-white">
+          <div className="absolute left-3 top-3 rounded-lg bg-black/70 px-3 py-2 text-sm text-white">
             {heading === null
               ? "Finding heading..."
               : `${heading.toFixed(0)}°`}
@@ -525,11 +646,42 @@ const startScan = async () => {
         </div>
       </div>
 
+      <div className="rounded-xl border border-blue-200 bg-blue-50 p-4 dark:border-blue-900 dark:bg-blue-950">
+        <p className="text-sm font-medium text-blue-800 dark:text-blue-200">
+          {capturedSectorCount === 8
+            ? "All eight directions captured"
+            : targetDirection
+              ? `Next target: ${targetDirection}`
+              : "Waiting for compass heading"}
+        </p>
+
+        <p className="mt-1 text-sm text-gray-700 dark:text-gray-200">
+          {turnInstruction}
+        </p>
+
+        {headingSource === "estimated" && (
+          <p className="mt-2 text-xs text-amber-700 dark:text-amber-300">
+            Heading is approximate. If directions appear inaccurate,
+            move slowly and use the manual capture control.
+          </p>
+        )}
+
+        {selectedSector !== null && (
+          <button
+            type="button"
+            onClick={() => setSelectedSector(null)}
+            className="mt-3 min-h-11 rounded-lg border border-blue-300 px-3 py-2 text-sm dark:border-blue-700"
+          >
+            Return to automatic guidance
+          </button>
+        )}
+      </div>
+
       <div className="space-y-2">
         <div className="flex items-center justify-between text-sm">
           <span className="font-medium">Scan coverage</span>
           <span className="tabular-nums">
-            {frames.length}/{BIN_COUNT} sectors · {coverage}%
+            {capturedSectorCount}/8 directions · {coverage}%
           </span>
         </div>
 
@@ -538,8 +690,8 @@ const startScan = async () => {
           role="progressbar"
           aria-label="Horizon scan coverage"
           aria-valuemin={0}
-          aria-valuemax={BIN_COUNT}
-          aria-valuenow={frames.length}
+          aria-valuemax={8}
+          aria-valuenow={capturedSectorCount}
         >
           <div
             className="h-full rounded-full bg-blue-600 transition-all"
@@ -547,25 +699,51 @@ const startScan = async () => {
           />
         </div>
 
-        <div className="grid grid-cols-6 gap-1 sm:grid-cols-12">
-          {Array.from({ length: BIN_COUNT }, (_, bin) => {
-            const captured = frames.some(
-              (frame) => getBin(frame.azimuth) === bin
-            );
+        <div className="grid grid-cols-4 gap-2 sm:grid-cols-8">
+          {GUIDED_DIRECTIONS.map((direction, sector) => {
+            const captured = capturedSectors[sector];
+            const isCurrent = currentSector === sector;
+            const isTarget = guidedTarget === sector;
 
             return (
-              <div
-                key={bin}
-                title={`${getBinCenter(bin)}° sector`}
-                className={`h-2 rounded-sm ${
+              <button
+                key={direction}
+                type="button"
+                onClick={() => {
+                  setSelectedSector(sector);
+                  setError(null);
+                  setMessage(
+                    `Recovery selected: ${direction}. Point the camera toward ${direction}, then capture this direction.`
+                  );
+                }}
+                aria-pressed={isTarget}
+                className={`min-h-14 rounded-lg border p-2 text-sm transition ${
                   captured
-                    ? "bg-blue-600"
-                    : "bg-gray-200 dark:bg-gray-700"
+                    ? "border-green-600 bg-green-50 text-green-800 dark:bg-green-950 dark:text-green-200"
+                    : isTarget
+                      ? "border-blue-600 bg-blue-50 text-blue-800 dark:bg-blue-950 dark:text-blue-200"
+                      : "border-gray-300 dark:border-gray-700"
                 }`}
-              />
+              >
+                <span className="block font-semibold">
+                  {SHORT_DIRECTIONS[sector]}
+                </span>
+                <span className="block text-xs">
+                  {captured
+                    ? "Captured"
+                    : isCurrent
+                      ? "Here"
+                      : "Missing"}
+                </span>
+              </button>
             );
           })}
         </div>
+
+        <p className="text-xs text-gray-500">
+          Tap any direction to select or retry it. Captured directions
+          can be recaptured if needed.
+        </p>
       </div>
 
       <p
@@ -589,7 +767,7 @@ const startScan = async () => {
           <button
             type="button"
             onClick={startScan}
-            className="rounded-lg bg-blue-600 px-4 py-2 text-white hover:bg-blue-700"
+            className="min-h-11 rounded-lg bg-blue-600 px-4 py-2 text-white hover:bg-blue-700"
           >
             Start 360° scan
           </button>
@@ -598,7 +776,7 @@ const startScan = async () => {
             <button
               type="button"
               onClick={captureFrame}
-              className="rounded-lg border px-4 py-2 hover:bg-gray-100 dark:hover:bg-gray-800"
+              className="min-h-11 rounded-lg border px-4 py-2 hover:bg-gray-100 dark:hover:bg-gray-800"
             >
               Capture this direction
             </button>
@@ -606,7 +784,7 @@ const startScan = async () => {
             <button
               type="button"
               onClick={finishScan}
-              className="rounded-lg bg-blue-600 px-4 py-2 text-white hover:bg-blue-700"
+              className="min-h-11 rounded-lg bg-blue-600 px-4 py-2 text-white hover:bg-blue-700"
             >
               Finish scan
             </button>
@@ -616,7 +794,7 @@ const startScan = async () => {
         <button
           type="button"
           onClick={cancelScan}
-          className="rounded-lg border px-4 py-2 hover:bg-gray-100 dark:hover:bg-gray-800"
+          className="min-h-11 rounded-lg border px-4 py-2 hover:bg-gray-100 dark:hover:bg-gray-800"
         >
           Cancel
         </button>
@@ -625,8 +803,8 @@ const startScan = async () => {
       <p className="text-xs text-gray-500">
         Captured images remain in browser memory in this prototype.
         Heading estimates may be inaccurate on some devices. This
-        step records frames; it does not yet calculate obstruction
-        altitudes or save a horizon profile.
+        scan records frames and directions; it does not yet calculate
+        obstruction altitudes or save a horizon profile.
       </p>
     </section>
   );
