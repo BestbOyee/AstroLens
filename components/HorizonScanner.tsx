@@ -45,6 +45,24 @@ const SHORT_DIRECTIONS = [
   "NW",
 ] as const;
 
+function getCompassDirection(azimuth: number): string {
+  const directions = [
+    "N",
+    "NE",
+    "E",
+    "SE",
+    "S",
+    "SW",
+    "W",
+    "NW",
+  ];
+
+  const index =
+    Math.round(normalizeAzimuth(azimuth) / 45) % 8;
+
+  return directions[index];
+}
+
 function normalizeAzimuth(value: number): number {
   return ((value % 360) + 360) % 360;
 }
@@ -604,6 +622,76 @@ export default function HorizonScanner({
           className="aspect-video w-full object-cover"
           aria-label="Live camera preview for the horizon scan"
         />
+        
+{cameraReady && heading !== null && (
+  <div className="absolute bottom-3 left-3 right-3 flex items-center gap-4 rounded-2xl border border-white/20 bg-black/75 p-3 text-white shadow-lg backdrop-blur-md">
+    {/* Rotating compass dial */}
+    <div className="relative h-24 w-24 shrink-0">
+      {/* Fixed pointer: the direction the phone faces */}
+      <div className="absolute left-1/2 top-0 z-10 -translate-x-1/2">
+        <div className="h-0 w-0 border-x-[7px] border-b-[11px] border-x-transparent border-b-cyan-400" />
+      </div>
+
+      {/* Dial rotates opposite to the phone heading */}
+      <div
+        className="absolute inset-1 rounded-full border border-white/40 transition-transform duration-150"
+        style={{
+          transform: `rotate(${-heading}deg)`,
+        }}
+      >
+        <div className="absolute inset-0 rounded-full">
+          {[
+            { label: "N", angle: 0 },
+            { label: "NE", angle: 45 },
+            { label: "E", angle: 90 },
+            { label: "SE", angle: 135 },
+            { label: "S", angle: 180 },
+            { label: "SW", angle: 225 },
+            { label: "W", angle: 270 },
+            { label: "NW", angle: 315 },
+          ].map(({ label, angle }) => (
+            <span
+              key={label}
+              className={`absolute left-1/2 top-1/2 text-xs font-semibold ${
+                label === "N"
+                  ? "text-cyan-300"
+                  : "text-white/90"
+              }`}
+              style={{
+                transform: `translate(-50%, -50%) rotate(${angle}deg) translateY(-36px) rotate(${-angle}deg)`,
+              }}
+            >
+              {label}
+            </span>
+          ))}
+
+          {/* Center of compass */}
+          <div className="absolute left-1/2 top-1/2 h-2 w-2 -translate-x-1/2 -translate-y-1/2 rounded-full bg-cyan-400" />
+        </div>
+      </div>
+    </div>
+
+    {/* Live heading readout */}
+    <div className="min-w-0">
+      <p className="text-xs uppercase tracking-widest text-white/60">
+        Currently facing
+      </p>
+
+      <p className="mt-1 text-3xl font-semibold tracking-tight">
+        {getCompassDirection(heading)}
+        <span className="ml-2 text-lg font-normal text-cyan-300">
+          {Math.round(heading)}°
+        </span>
+      </p>
+
+      <p className="mt-1 text-xs text-white/70">
+        {headingSource === "compass"
+          ? "Compass heading"
+          : "Estimated heading"}
+      </p>
+    </div>
+  </div>
+)}
 
         {!cameraReady && (
           <div className="absolute inset-0 flex items-center justify-center p-6 text-center text-sm text-white">

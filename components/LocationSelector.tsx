@@ -33,65 +33,56 @@ export default function LocationSelector({
 
   // Load saved locations after mounting to avoid server-rendering issues.
   useEffect(() => {
-    const loadTimer = window.setTimeout(() => {
-      try {
-        const stored = window.localStorage.getItem(STORAGE_KEY);
+    try {
+      const stored = window.localStorage.getItem(STORAGE_KEY);
 
-        if (stored) {
-          const parsed: unknown = JSON.parse(stored);
+      if (stored) {
+        const parsed: unknown = JSON.parse(stored);
 
-          if (Array.isArray(parsed)) {
-            const validLocations = parsed.filter(
-              (item): item is SavedLocation =>
-                item !== null &&
-                typeof item === "object" &&
-                typeof item.id === "string" &&
-                typeof item.name === "string" &&
-                item.name.trim().length > 0 &&
-                typeof item.latitude === "number" &&
-                Number.isFinite(item.latitude) &&
-                item.latitude >= -90 &&
-                item.latitude <= 90 &&
-                typeof item.longitude === "number" &&
-                Number.isFinite(item.longitude) &&
-                item.longitude >= -180 &&
-                item.longitude <= 180 &&
-                typeof item.elevation === "number" &&
-                Number.isFinite(item.elevation)
-            );
+        if (Array.isArray(parsed)) {
+          const validLocations = parsed.filter(
+            (item): item is SavedLocation =>
+              item !== null &&
+              typeof item === "object" &&
+              typeof item.id === "string" &&
+              typeof item.name === "string" &&
+              item.name.trim().length > 0 &&
+              typeof item.latitude === "number" &&
+              Number.isFinite(item.latitude) &&
+              item.latitude >= -90 &&
+              item.latitude <= 90 &&
+              typeof item.longitude === "number" &&
+              Number.isFinite(item.longitude) &&
+              item.longitude >= -180 &&
+              item.longitude <= 180 &&
+              typeof item.elevation === "number" &&
+              Number.isFinite(item.elevation)
+          );
 
-            setSavedLocations(validLocations);
-          }
+          setSavedLocations(validLocations);
         }
-      } catch {
-        setSaveError("Could not load saved locations from this browser.");
-      } finally {
-        setStorageReady(true);
       }
-
-    }, 0);
-
-    return () => window.clearTimeout(loadTimer);
+    } catch {
+      setSaveError("Could not load saved locations from this browser.");
+    } finally {
+      setStorageReady(true);
+    }
   }, []);
 
   // Persist saved locations whenever the list changes.
   useEffect(() => {
     if (!storageReady) return;
 
-    const saveTimer = window.setTimeout(() => {
-      try {
-        window.localStorage.setItem(
-          STORAGE_KEY,
-          JSON.stringify(savedLocations)
-        );
-      } catch {
-        setSaveError(
-          "Could not save locations. Browser storage may be unavailable or full."
-        );
-      }
-    }, 0);
-
-    return () => window.clearTimeout(saveTimer);
+    try {
+      window.localStorage.setItem(
+        STORAGE_KEY,
+        JSON.stringify(savedLocations)
+      );
+    } catch {
+      setSaveError(
+        "Could not save locations. Browser storage may be unavailable or full."
+      );
+    }
   }, [savedLocations, storageReady]);
 
   function updateLocation(
