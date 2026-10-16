@@ -22,6 +22,8 @@ const BIN_SIZE = 360 / BIN_COUNT;
 const IMAGE_WIDTH = 640;
 const IMAGE_HEIGHT = 360;
 const GUIDED_SECTOR_SIZE = 45;
+const STABLE_HEADING_MS = 700;
+const HEADING_TOLERANCE_DEGREES = 4;
 
 const GUIDED_DIRECTIONS = [
   "North",
@@ -45,24 +47,6 @@ const SHORT_DIRECTIONS = [
   "NW",
 ] as const;
 
-function getCompassDirection(azimuth: number): string {
-  const directions = [
-    "N",
-    "NE",
-    "E",
-    "SE",
-    "S",
-    "SW",
-    "W",
-    "NW",
-  ];
-
-  const index =
-    Math.round(normalizeAzimuth(azimuth) / 45) % 8;
-
-  return directions[index];
-}
-
 function normalizeAzimuth(value: number): number {
   return ((value % 360) + 360) % 360;
 }
@@ -71,14 +55,19 @@ function getBin(azimuth: number): number {
   return Math.floor(normalizeAzimuth(azimuth) / BIN_SIZE);
 }
 
-function getBinCenter(bin: number): number {
-  return normalizeAzimuth(bin * BIN_SIZE + BIN_SIZE / 2);
-}
-
 function getGuidedSector(azimuth: number): number {
   return (
     Math.round(normalizeAzimuth(azimuth) / GUIDED_SECTOR_SIZE) % 8
   );
+}
+
+function getCompassDirection(azimuth: number): string {
+  return SHORT_DIRECTIONS[getGuidedSector(azimuth)];
+}
+
+function angularDifference(a: number, b: number): number {
+  const difference = Math.abs(a - b);
+  return Math.min(difference, 360 - difference);
 }
 
 function getHeading(
@@ -133,6 +122,7 @@ export default function HorizonScanner({
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
+
   const framesRef = useRef<Map<number, HorizonScanFrame>>(
     new Map()
   );
@@ -187,7 +177,7 @@ export default function HorizonScanner({
     setCameraReady(false);
   }, []);
 
-  const startCamera = useCallback(async () => {
+  const startCamera = useCallback(async (): Promise<boolean> => {
     setError(null);
 
     if (!navigator.mediaDevices?.getUserMedia) {
@@ -224,8 +214,7 @@ export default function HorizonScanner({
       setCameraReady(true);
       return true;
     } catch (caught) {
-      const name =
-        caught instanceof Error ? caught.name : "";
+      const name = caught instanceof Error ? caught.name : "";
 
       if (name === "NotAllowedError") {
         setError(
@@ -243,7 +232,7 @@ export default function HorizonScanner({
     }
   }, []);
 
-  const enableSensors = useCallback(async () => {
+  const enableSensors = useCallback(async (): Promise<boolean> => {
     setError(null);
 
     if (typeof window === "undefined") {
@@ -366,8 +355,7 @@ export default function HorizonScanner({
       headingSource: orientation.source,
     };
 
-    // Retain the newest frame for each 15-degree bin.
-    // The guided interface groups these bins into eight 45-degree sectors.
+    // Keep the newest image in each 15-degree bin.
     framesRef.current.set(bin, frame);
 
     const updatedFrames = Array.from(
@@ -377,13 +365,9 @@ export default function HorizonScanner({
     setFrames(updatedFrames);
 
     setMessage(
-      `${GUIDED_DIRECTIONS[sector]} captured at ${Math.round(
+      `Captured ${GUIDED_DIRECTIONS[sector]} at ${Math.round(
         orientation.azimuth
-      )}°. ${
-        updatedFrames.length > 0
-          ? "Continue to the next missing direction."
-          : "Continue rotating slowly."
-      }`
+      )}°. You can continue to the next missing direction or select a direction to retry.`
     );
   }, []);
 
@@ -393,7 +377,9 @@ export default function HorizonScanner({
     }
 
     let lastAutoCapturedSector: number | null = null;
-    let lastCaptureTime = 0;
+    let lastSeenSector: number | null = null;
+    let previousHeading: number | null = null;
+    let stableSince = 0;
 
     const handleOrientation = (
       event: DeviceOrientationEvent
@@ -402,10 +388,12 @@ export default function HorizonScanner({
 
       if (!result) {
         setMessage(
-          "No reliable heading is available. Check sensor permissions or use manual capture when a heading appears."
+          "Waiting for a reliable heading. Check motion permissions or use manual capture when a heading becomes available."
         );
         return;
       }
+
+      const nowMs = Date.now();
 
       const nextPitch =
         typeof event.beta === "number" ? event.beta : null;
@@ -426,25 +414,49 @@ export default function HorizonScanner({
       setHeadingSource(result.source);
 
       const sector = getGuidedSector(result.azimuth);
-      const nowMs = Date.now();
 
       setCurrentSector(sector);
 
-      // Capture once when entering an uncaptured 45-degree sector.
-      // The cooldown avoids duplicate captures from noisy sensors.
+      const enteredNewSector = sector !== lastSeenSector;
+
+      if (enteredNewSector) {
+        lastSeenSector = sector;
+        stableSince = nowMs;
+        previousHeading = result.azimuth;
+
+        setMessage(
+          `Facing ${GUIDED_DIRECTIONS[sector]}. Hold steady while AstroLens checks the heading.`
+        );
+      } else if (
+        previousHeading === null ||
+        angularDifference(result.azimuth, previousHeading) >
+          HEADING_TOLERANCE_DEGREES
+      ) {
+        // Restart the stability timer if the phone is still moving.
+        stableSince = nowMs;
+        previousHeading = result.azimuth;
+      }
+
+      const headingIsStable =
+        stableSince > 0 &&
+        nowMs - stableSince >= STABLE_HEADING_MS;
+
+      const sectorIsMissing = !isSectorCaptured(
+        sector,
+        Array.from(framesRef.current.values())
+      );
+
+      const selectedTargetMatches =
+        selectedSector === null || selectedSector === sector;
+
       if (
-        sector !== lastAutoCapturedSector &&
-        nowMs - lastCaptureTime > 1200 &&
-        !isSectorCaptured(
-          sector,
-          Array.from(framesRef.current.values())
-        )
+        headingIsStable &&
+        sectorIsMissing &&
+        selectedTargetMatches &&
+        lastAutoCapturedSector !== sector
       ) {
         lastAutoCapturedSector = sector;
-        lastCaptureTime = nowMs;
         captureFrame();
-      } else {
-        lastAutoCapturedSector = sector;
       }
     };
 
@@ -456,12 +468,12 @@ export default function HorizonScanner({
         handleOrientation
       );
     };
-  }, [scanning, captureFrame]);
+  }, [scanning, captureFrame, selectedSector]);
 
   const startScan = async () => {
     setError(null);
 
-    // Request both permissions directly from the user's button action.
+    // Request both permissions from the user's button action.
     const sensorPromise = enableSensors();
     const cameraPromise = startCamera();
 
@@ -487,7 +499,7 @@ export default function HorizonScanner({
     setSelectedSector(null);
 
     setMessage(
-      "Start facing north, then rotate clockwise in small, slow movements. Pause briefly in each direction."
+      "Start facing north, then rotate clockwise slowly. Pause in each direction to capture it."
     );
 
     setScanning(true);
@@ -523,13 +535,16 @@ export default function HorizonScanner({
   const cancelScan = () => {
     setScanning(false);
     stopCamera();
+
     framesRef.current.clear();
     latestOrientationRef.current = null;
+
     setFrames([]);
     setCurrentSector(null);
     setSelectedSector(null);
     setError(null);
     setMessage("Scan cancelled.");
+
     onCancel?.();
   };
 
@@ -576,7 +591,7 @@ export default function HorizonScanner({
 
     if (selectedSector !== null) {
       if (currentSector === selectedSector) {
-        return `You are pointing toward ${GUIDED_DIRECTIONS[selectedSector]}. Pause and tap “Capture this direction.”`;
+        return `You are pointing toward ${GUIDED_DIRECTIONS[selectedSector]}. Pause and tap “Capture this direction” if it has not been captured.`;
       }
 
       return `Slowly rotate toward ${GUIDED_DIRECTIONS[selectedSector]}. Tap “Capture this direction” when you are pointing that way.`;
@@ -622,76 +637,6 @@ export default function HorizonScanner({
           className="aspect-video w-full object-cover"
           aria-label="Live camera preview for the horizon scan"
         />
-        
-{cameraReady && heading !== null && (
-  <div className="absolute bottom-3 left-3 right-3 flex items-center gap-4 rounded-2xl border border-white/20 bg-black/75 p-3 text-white shadow-lg backdrop-blur-md">
-    {/* Rotating compass dial */}
-    <div className="relative h-24 w-24 shrink-0">
-      {/* Fixed pointer: the direction the phone faces */}
-      <div className="absolute left-1/2 top-0 z-10 -translate-x-1/2">
-        <div className="h-0 w-0 border-x-[7px] border-b-[11px] border-x-transparent border-b-cyan-400" />
-      </div>
-
-      {/* Dial rotates opposite to the phone heading */}
-      <div
-        className="absolute inset-1 rounded-full border border-white/40 transition-transform duration-150"
-        style={{
-          transform: `rotate(${-heading}deg)`,
-        }}
-      >
-        <div className="absolute inset-0 rounded-full">
-          {[
-            { label: "N", angle: 0 },
-            { label: "NE", angle: 45 },
-            { label: "E", angle: 90 },
-            { label: "SE", angle: 135 },
-            { label: "S", angle: 180 },
-            { label: "SW", angle: 225 },
-            { label: "W", angle: 270 },
-            { label: "NW", angle: 315 },
-          ].map(({ label, angle }) => (
-            <span
-              key={label}
-              className={`absolute left-1/2 top-1/2 text-xs font-semibold ${
-                label === "N"
-                  ? "text-cyan-300"
-                  : "text-white/90"
-              }`}
-              style={{
-                transform: `translate(-50%, -50%) rotate(${angle}deg) translateY(-36px) rotate(${-angle}deg)`,
-              }}
-            >
-              {label}
-            </span>
-          ))}
-
-          {/* Center of compass */}
-          <div className="absolute left-1/2 top-1/2 h-2 w-2 -translate-x-1/2 -translate-y-1/2 rounded-full bg-cyan-400" />
-        </div>
-      </div>
-    </div>
-
-    {/* Live heading readout */}
-    <div className="min-w-0">
-      <p className="text-xs uppercase tracking-widest text-white/60">
-        Currently facing
-      </p>
-
-      <p className="mt-1 text-3xl font-semibold tracking-tight">
-        {getCompassDirection(heading)}
-        <span className="ml-2 text-lg font-normal text-cyan-300">
-          {Math.round(heading)}°
-        </span>
-      </p>
-
-      <p className="mt-1 text-xs text-white/70">
-        {headingSource === "compass"
-          ? "Compass heading"
-          : "Estimated heading"}
-      </p>
-    </div>
-  </div>
-)}
 
         {!cameraReady && (
           <div className="absolute inset-0 flex items-center justify-center p-6 text-center text-sm text-white">
@@ -699,12 +644,59 @@ export default function HorizonScanner({
           </div>
         )}
 
-        {cameraReady && (
-          <div className="absolute left-3 top-3 rounded-lg bg-black/70 px-3 py-2 text-sm text-white">
-            {heading === null
-              ? "Finding heading..."
-              : `${heading.toFixed(0)}°`}
-            {headingSource === "estimated" ? " · approximate" : ""}
+        {cameraReady && heading !== null && (
+          <div className="absolute bottom-3 left-3 right-3 flex items-center gap-3 rounded-2xl border border-white/20 bg-black/75 p-3 text-white shadow-lg backdrop-blur-md">
+            <div className="relative h-20 w-20 shrink-0">
+              <div className="absolute left-1/2 top-0 z-10 -translate-x-1/2">
+                <div className="h-0 w-0 border-x-[7px] border-b-[11px] border-x-transparent border-b-cyan-400" />
+              </div>
+
+              <div
+                className="absolute inset-1 rounded-full border border-white/40 transition-transform duration-150"
+                style={{ transform: `rotate(${-heading}deg)` }}
+              >
+                {SHORT_DIRECTIONS.map((label, index) => {
+                  const angle = index * 45;
+
+                  return (
+                    <span
+                      key={label}
+                      className={`absolute left-1/2 top-1/2 text-xs font-semibold ${
+                        label === "N"
+                          ? "text-cyan-300"
+                          : "text-white/90"
+                      }`}
+                      style={{
+                        transform: `translate(-50%, -50%) rotate(${angle}deg) translateY(-29px) rotate(${-angle}deg)`,
+                      }}
+                    >
+                      {label}
+                    </span>
+                  );
+                })}
+
+                <div className="absolute left-1/2 top-1/2 h-2 w-2 -translate-x-1/2 -translate-y-1/2 rounded-full bg-cyan-400" />
+              </div>
+            </div>
+
+            <div className="min-w-0">
+              <p className="text-xs uppercase tracking-widest text-white/60">
+                Currently facing
+              </p>
+
+              <p className="mt-1 text-3xl font-semibold tracking-tight">
+                {getCompassDirection(heading)}
+                <span className="ml-2 text-lg font-normal text-cyan-300">
+                  {Math.round(heading)}°
+                </span>
+              </p>
+
+              <p className="mt-1 text-xs text-white/70">
+                {headingSource === "compass"
+                  ? "Compass heading"
+                  : "Estimated heading"}
+              </p>
+            </div>
           </div>
         )}
       </div>
@@ -749,8 +741,8 @@ export default function HorizonScanner({
 
         {headingSource === "estimated" && (
           <p className="mt-2 text-xs text-amber-700 dark:text-amber-300">
-            Heading is approximate. If directions appear inaccurate,
-            move slowly and use the manual capture control.
+            Heading is approximate. Move slowly and use manual
+            capture if directions appear inaccurate.
           </p>
         )}
 
@@ -816,6 +808,7 @@ export default function HorizonScanner({
                 <span className="block font-semibold">
                   {SHORT_DIRECTIONS[sector]}
                 </span>
+
                 <span className="block text-xs">
                   {captured
                     ? "Captured"
@@ -829,7 +822,7 @@ export default function HorizonScanner({
         </div>
 
         <p className="text-xs text-gray-500">
-          Tap any direction to select or retry it. Captured directions
+          Select any direction to retry it. Captured directions
           can be recaptured if needed.
         </p>
       </div>
