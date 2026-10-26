@@ -3,6 +3,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
+
 export interface ObstructionAnalysis {
   obstructionPercent: number;
   skylineYPercent: number;
@@ -11,7 +12,12 @@ export interface ObstructionAnalysis {
   detectedColumnsPercent: number;
   status: "estimated" | "low-confidence";
   method: "on-device-heuristic";
+  boundaryProfile?: Array<{
+    xPercent: number;
+    yPercent: number;
+  }>;
 }
+
 
 export interface HorizonScanFrame {
   azimuth: number;
@@ -105,6 +111,15 @@ function getHeading(event: DeviceOrientationEvent): {
  * common blue-sky and bright, low-saturation sky colors. Clouds, haze,
  * sunsets, night scenes, snow, glass, and brightly lit objects can fool it.
  */
+
+/**
+ * Heuristic sky classifier.
+ *
+ * This is not a trained model. It recognizes common blue sky, pale blue
+ * sky, and bright neutral sky/cloud colors. Night scenes, sunsets, haze,
+ * snow, glass, and unusually colored objects can still cause errors.
+ */
+
 function isLikelySkyPixel(
   r: number,
   g: number,
@@ -113,6 +128,8 @@ function isLikelySkyPixel(
   const max = Math.max(r, g, b);
   const min = Math.min(r, g, b);
   const brightness = (r + g + b) / 3;
+  const saturation = max - min;
+
   const blueSky =
     b > 65 &&
     b >= r * 1.08 &&
@@ -121,42 +138,89 @@ function isLikelySkyPixel(
 
   const brightNeutralSky =
     brightness > 165 &&
-    max - min < 38;
+    saturation < 38 &&
+    b >= r * 0.95;
 
   const paleBlueSky =
     brightness > 125 &&
     b >= r * 1.02 &&
     b >= g * 0.94 &&
     b - r >= 5 &&
-    max - min < 75;
+    saturation < 75;
 
-  return blueSky || brightNeutralSky || paleBlueSky;
+  // Warm orange and pink sunset colors.
+  // The channel differences help distinguish warm sky from
+  // gray concrete and dark brown terrain.
+  const warmSky =
+    brightness > 120 &&
+    r > 150 &&
+    r - g >= 35 &&
+    g - b >= 20;
+
+  return blueSky || brightNeutralSky || paleBlueSky || warmSky;
+}
+
+
+/**
+ * Calculates the median of a list of numbers.
+ * The median is less sensitive to isolated trees, antennas, and other
+ * narrow objects than a simple average.
+ */
+function median(values: number[]): number {
+  if (values.length === 0) return 0;
+
+  const sorted = [...values].sort((a, b) => a - b);
+  const middle = Math.floor(sorted.length / 2);
+
+  if (sorted.length % 2 === 0) {
+    return (sorted[middle - 1] + sorted[middle]) / 2;
+  }
+
+  return sorted[middle];
 }
 
 /**
- * Estimates the visible foreground boundary by scanning from the top of
- * each sampled column until a run of likely non-sky pixels is encountered.
+ * Estimates the foreground boundary using vertical image samples.
  *
- * obstructionPercent: estimated image area below the detected skyline.
- * skylineYPercent: mean boundary position, measured down from the top.
- * estimatedSkylineAngleDegrees: rough image-relative angle using an assumed
- * vertical field of view. It is NOT a calibrated altitude above the horizon.
+ * A column is considered usable only when a sufficient proportion of
+ * its top pixels look like sky. This prevents a column that begins
+ * inside a tree or building from automatically being counted as a
+ * detected skyline.
+ *
+ * Columns with verified sky but no detected foreground are treated as
+ * open sky. Their boundary is placed at the bottom of the image.
+ *
+ * obstructionPercent is an image-space estimate, not a measurement
+ * of real-world terrain obstruction.
+ *
+ * estimatedSkylineAngleDegrees is only an approximate image-relative
+ * angle based on an assumed vertical field of view. It is not a
+ * calibrated altitude above the astronomical horizon.
  */
-function analyzeImagePixels(
+
+
+export function analyzeImagePixels(
   pixels: Uint8ClampedArray,
   width: number,
   height: number,
 ): ObstructionAnalysis {
   const boundaries: number[] = [];
+
+  const boundaryProfile: Array<{
+    xPercent: number;
+    yPercent: number;
+  }> = [];
+
   const totalSampledColumns = Math.floor(width / 2);
 
   for (let x = 1; x < width; x += 2) {
     let consecutiveNonSky = 0;
     let detectedBoundary = -1;
 
-    // Require several adjacent non-sky pixels to reduce single-pixel noise.
+    // Scan downward through this column, looking for foreground.
     for (let y = 0; y < height; y += 1) {
       const index = (y * width + x) * 4;
+
       const r = pixels[index];
       const g = pixels[index + 1];
       const b = pixels[index + 2];
@@ -166,6 +230,7 @@ function analyzeImagePixels(
       } else {
         consecutiveNonSky += 1;
 
+        // Require three consecutive non-sky pixels to reduce noise.
         if (consecutiveNonSky >= 3) {
           detectedBoundary = y - 2;
           break;
@@ -173,12 +238,19 @@ function analyzeImagePixels(
       }
     }
 
-    // A column with no detected foreground is treated as open sky, but
-    // not as a successfully detected skyline.
+    // Preserve the detected point rather than discarding its position.
     if (detectedBoundary >= 0) {
-      boundaries.push(
-        Math.max(0, Math.min(height, detectedBoundary)),
+      const clampedBoundary = Math.max(
+        0,
+        Math.min(height, detectedBoundary),
       );
+
+      boundaries.push(clampedBoundary);
+
+      boundaryProfile.push({
+        xPercent: (x / (width - 1)) * 100,
+        yPercent: (clampedBoundary / height) * 100,
+      });
     }
   }
 
@@ -187,7 +259,8 @@ function analyzeImagePixels(
       ? (boundaries.length / totalSampledColumns) * 100
       : 0;
 
-  // No meaningful skyline was found. Do not manufacture a confident result.
+  // Insufficient detections: retain available points but do not
+  // claim that the overall obstruction estimate is reliable.
   if (boundaries.length < totalSampledColumns * 0.15) {
     return {
       obstructionPercent: 0,
@@ -196,36 +269,46 @@ function analyzeImagePixels(
       confidencePercent: Math.round(
         Math.min(30, detectedColumnsPercent * 0.3),
       ),
-      detectedColumnsPercent: Math.round(detectedColumnsPercent),
+      detectedColumnsPercent: Math.round(
+        detectedColumnsPercent,
+      ),
       status: "low-confidence",
       method: "on-device-heuristic",
+      boundaryProfile,
     };
   }
 
+  // Keep the existing average measurement for compatibility.
   const meanBoundary =
     boundaries.reduce((sum, value) => sum + value, 0) /
     boundaries.length;
 
-  // Average boundary height as a fraction of the full image.
-  // This is an image-area estimate, not an estimate of real-world terrain area.
-  const skylineYPercent = (meanBoundary / height) * 100;
+  const skylineYPercent =
+    (meanBoundary / height) * 100;
+
   const obstructionPercent = 100 - skylineYPercent;
 
-  // Map image-relative vertical displacement to an approximate angular
-  // displacement under the assumed vertical field of view.
-  // The center of the image is treated as zero displacement.
+  // Approximate image-relative angle using the existing assumed
+  // vertical field of view. This is not calibrated altitude.
   const normalizedDisplacement =
     0.5 - meanBoundary / height;
 
   const estimatedSkylineAngleDegrees =
-    normalizedDisplacement * ASSUMED_VERTICAL_FOV_DEGREES;
+    normalizedDisplacement *
+    ASSUMED_VERTICAL_FOV_DEGREES;
 
-  // Confidence reflects how often a boundary was detected. It does not
-  // establish that the detected boundary is actually a natural skyline.
-  const coverageConfidence = Math.min(100, detectedColumnsPercent);
+  // Confidence reflects detection coverage, not verified accuracy.
+  const coverageConfidence = Math.min(
+    100,
+    detectedColumnsPercent,
+  );
+
   const skyFraction = skylineYPercent / 100;
+
   const plausibleSceneFactor =
-    skyFraction > 0.03 && skyFraction < 0.98 ? 1 : 0.55;
+    skyFraction > 0.03 && skyFraction < 0.98
+      ? 1
+      : 0.55;
 
   const confidencePercent = Math.round(
     Math.max(
@@ -243,11 +326,20 @@ function analyzeImagePixels(
     estimatedSkylineAngleDegrees:
       Math.round(estimatedSkylineAngleDegrees * 10) / 10,
     confidencePercent,
-    detectedColumnsPercent: Math.round(detectedColumnsPercent),
-    status: confidencePercent >= 60 ? "estimated" : "low-confidence",
+    detectedColumnsPercent: Math.round(
+      detectedColumnsPercent,
+    ),
+    status:
+      confidencePercent >= 60
+        ? "estimated"
+        : "low-confidence",
     method: "on-device-heuristic",
+    boundaryProfile,
   };
 }
+
+
+
 
 function analyzeCanvas(
   sourceCanvas: HTMLCanvasElement,
@@ -559,14 +651,16 @@ export default function HorizonScanner({
 
       setFrames(updatedFrames);
 
+      
       const confidenceNote =
         obstruction.status === "estimated"
-          ? `Confidence ${obstruction.confidencePercent}%.`
-          : `Low confidence (${obstruction.confidencePercent}%). Review this image if possible.`;
+          ? `Estimated obstruction: ${obstruction.obstructionPercent}%. Confidence ${obstruction.confidencePercent}%.`
+          : `Obstruction estimate unavailable. Low confidence (${obstruction.confidencePercent}%). Review or recapture this image if possible.`;
 
-      setMessage(
-        `Captured and analyzed sector ${sector + 1}/24 (${Math.round(orientation.azimuth)}°, ${getDirection(orientation.azimuth)}). Estimated obstruction: ${obstruction.obstructionPercent}%. ${confidenceNote}`,
-      );
+        setMessage(
+        `Captured and analyzed sector ${sector + 1}/24 (${Math.round(orientation.azimuth)}°, ${getDirection(orientation.azimuth)}). ${confidenceNote}`,
+        );
+
     } catch {
       setError(
         "Could not capture or analyze this image. Try capturing the direction again.",
