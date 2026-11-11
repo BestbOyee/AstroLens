@@ -1,130 +1,112 @@
+
 "use client";
 
 import Image from "next/image";
-import { useEffect, useMemo, useState } from "react";
+import { useState } from "react";
 
-import { getObservingRecommendations } from "@/lib/recommendations";
-import { astronomicalObjects } from "@/data/objects";
 import HorizonEditor from "@/components/HorizonEditor";
-import SkyMap from "@/components/SkyMap";
 import HorizonScanner, {
   type HorizonScanFrame,
 } from "@/components/HorizonScanner";
-import type { HorizonProfile, ObserverLocation } from "@/types/astronomy";
-import { useCurrentWeather } from "@/hooks/useCurrentWeather";
 import WeatherPanel from "@/components/WeatherPanel";
+import { useCurrentWeather } from "@/hooks/useCurrentWeather";
+import { useObservatory } from "@/context/ObservatoryContext";
+
 export default function RecommendationsPage() {
-  const [bortleClass, setBortleClass] = useState(6);
+  const {
+    location,
+    horizon,
+    setHorizon,
+    bortleClass,
+    setBortleClass,
+  } = useObservatory();
+
   const [scanFrames, setScanFrames] = useState<HorizonScanFrame[]>([]);
-  const [location, setLocation] = useState<ObserverLocation>({
-    latitude: 40.7128,
-    longitude: -74.006,
-    elevation: 10,
-  });
+
   const {
     weather,
     loading: weatherLoading,
     error: weatherError,
     lastUpdated: weatherLastUpdated,
-  } = useCurrentWeather(location.latitude, location.longitude);
-  const [horizon, setHorizon] = useState<HorizonProfile>({
-    points: [],
-  });
-
-  const [now, setNow] = useState<Date | null>(null);
-
-  useEffect(() => {
-    setNow(new Date());
-
-    const timer = window.setInterval(() => {
-      setNow(new Date());
-    }, 60_000);
-
-    return () => {
-      window.clearInterval(timer);
-    };
-  }, []);
-
-  const refreshSky = () => {
-    setNow(new Date());
-  };
-
-  const baseRecommendations = useMemo(() => {
-    if (!now) {
-      return [];
-    }
-
-    return getObservingRecommendations(
-      astronomicalObjects,
-      location,
-      horizon,
-      now,
-      bortleClass,
-    );
-  }, [now, bortleClass, location, horizon]);
-
-  const recommendations = useMemo(() => {
-    if (!weather) {
-      return baseRecommendations;
-    }
-
-    // Initial heuristic: heavier cloud cover reduces observing scores.
-    const cloudFactor = Math.max(0.15, 1 - (weather.cloudCover / 100) * 0.85);
-
-    return baseRecommendations.map((recommendation) => ({
-      ...recommendation,
-      score: Math.round(recommendation.score * cloudFactor),
-      reasons: [
-        ...recommendation.reasons,
-        weather.cloudCover > 0
-          ? `Weather adjustment: ${weather.cloudCover}% cloud cover; estimated score factor ${Math.round(cloudFactor * 100)}%.`
-          : "Weather adjustment: no cloud-cover penalty.",
-      ],
-    }));
-  }, [baseRecommendations, weather]);
-
-  const skyMapTargets = useMemo(
-    () =>
-      recommendations.map((recommendation) => ({
-        id: recommendation.object.id,
-        name: recommendation.object.name,
-        type: recommendation.object.type,
-        altitude: recommendation.object.position.altitude,
-        azimuth: recommendation.object.position.azimuth,
-        score: recommendation.score,
-      })),
-    [recommendations],
+  } = useCurrentWeather(
+    location.latitude,
+    location.longitude
   );
 
   return (
-    <main className="mx-auto max-w-4xl space-y-6 p-6">
-      <header className="space-y-3">
-        <p className="text-sm uppercase tracking-widest text-blue-500">
-          AstroLens
+    <main className="mx-auto w-full max-w-4xl space-y-5 px-4 py-5 sm:px-6 sm:py-8">
+      <header className="space-y-2">
+        <p className="text-xs font-semibold uppercase tracking-[0.2em] text-sky-500">
+          AstroLens Observatory
         </p>
 
-        <h1 className="text-3xl font-bold">What Should I Observe?</h1>
+        <h1 className="text-3xl font-bold tracking-tight sm:text-4xl">
+          Observe
+        </h1>
 
-        <p className="text-gray-600 dark:text-gray-300">
-          Discover celestial objects worth observing based on their current
-          positions, horizon obstructions, darkness, and estimated
-          light-pollution conditions.
-        </p>
-
-        <button
-          type="button"
-          onClick={refreshSky}
-          className="rounded-lg bg-blue-600 px-4 py-2 text-white hover:bg-blue-700"
-        >
-          Refresh sky conditions
-        </button>
-
-        <p className="text-sm text-gray-500">
-          {now
-            ? `Last calculated: ${now.toLocaleTimeString()}`
-            : "Initializing sky calculations..."}
+        <p className="max-w-2xl text-sm leading-relaxed text-gray-600 dark:text-gray-300 sm:text-base">
+          Configure your observing conditions and scan your
+          surroundings to help AstroLens determine which
+          celestial objects are actually visible.
         </p>
       </header>
+
+      <section className="rounded-xl border border-sky-900/30 bg-sky-950/10 p-4">
+        <h2 className="font-semibold">Your observing profile</h2>
+
+        <p className="mt-1 text-sm text-gray-600 dark:text-gray-300">
+          These settings are shared with the Sky page.
+        </p>
+
+        <div className="mt-3 grid grid-cols-2 gap-3">
+          <div>
+            <p className="text-xs text-gray-500">Latitude</p>
+            <p className="font-semibold tabular-nums">
+              {location.latitude.toFixed(4)}°
+            </p>
+          </div>
+
+          <div>
+            <p className="text-xs text-gray-500">Longitude</p>
+            <p className="font-semibold tabular-nums">
+              {location.longitude.toFixed(4)}°
+            </p>
+          </div>
+        </div>
+
+        <div className="mt-3">
+          <label htmlFor="bortle" className="mb-2 block text-sm font-medium">
+            Light pollution level
+          </label>
+
+          <select
+            id="bortle"
+            value={bortleClass}
+            onChange={(event) =>
+              setBortleClass(Number(event.target.value))
+            }
+            className="min-h-11 w-full rounded-lg border bg-transparent px-3 py-2 text-base"
+          >
+            {Array.from({ length: 9 }, (_, index) => index + 1).map(
+              (level) => (
+                <option key={level} value={level}>
+                  Bortle {level}
+                  {level === 1
+                    ? " — Excellent dark sky"
+                    : level === 9
+                      ? " — Inner-city sky"
+                      : ""}
+                </option>
+              )
+            )}
+          </select>
+
+          <p className="mt-2 text-xs text-gray-500">
+            Bortle 1 represents the darkest skies; Bortle 9
+            represents heavily light-polluted urban skies.
+          </p>
+        </div>
+      </section>
 
       <WeatherPanel
         weather={weather}
@@ -133,54 +115,56 @@ export default function RecommendationsPage() {
         lastUpdated={weatherLastUpdated}
       />
 
-      <section className="rounded-xl border p-4">
-        <label htmlFor="bortle" className="mb-2 block font-medium">
-          Light pollution level
-        </label>
+      <section className="space-y-3">
+        <div>
+          <h2 className="text-xl font-semibold">
+            Map your horizon
+          </h2>
 
-        <select
-          id="bortle"
-          value={bortleClass}
-          onChange={(event) => setBortleClass(Number(event.target.value))}
-          className="rounded-lg border bg-transparent p-2"
-        >
-          {Array.from({ length: 9 }, (_, index) => index + 1).map((level) => (
-            <option key={level} value={level}>
-              Bortle {level}
-              {level === 1
-                ? " — Excellent dark sky"
-                : level === 9
-                  ? " — Inner-city sky"
-                  : ""}
-            </option>
-          ))}
-        </select>
+          <p className="mt-1 text-sm text-gray-600 dark:text-gray-300">
+            Use the camera scanner for automatic estimates,
+            or adjust obstruction heights manually.
+          </p>
+        </div>
 
-        <p className="mt-2 text-sm text-gray-500">
-          Bortle 1 represents the darkest skies; Bortle 9 represents heavily
-          light-polluted urban skies.
-        </p>
+        <HorizonScanner
+          onScanComplete={(frames) => {
+            setScanFrames(frames);
+          }}
+          onCancel={() => {
+            setScanFrames([]);
+          }}
+        />
       </section>
 
-      <HorizonEditor profile={horizon} onChange={setHorizon} />
-      <HorizonScanner
-        onScanComplete={(frames) => {
-          setScanFrames(frames);
-        }}
-        onCancel={() => {
-          setScanFrames([]);
-        }}
-      />
+      <details className="rounded-xl border p-4">
+        <summary className="cursor-pointer font-semibold">
+          Manually edit horizon obstructions
+        </summary>
+
+        <div className="mt-4">
+          <HorizonEditor
+            profile={horizon}
+            onChange={setHorizon}
+          />
+        </div>
+      </details>
+
       {scanFrames.length > 0 && (
         <section className="space-y-3 rounded-xl border p-4">
-          <h2 className="text-lg font-semibold">Captured scan frames</h2>
+          <div>
+            <h2 className="text-lg font-semibold">
+              Completed scan
+            </h2>
 
-          <p className="text-sm text-gray-600 dark:text-gray-300">
-            {scanFrames.length} directional frames captured. Automatic
-            obstruction detection is the next step.
-          </p>
+            <p className="mt-1 text-sm text-gray-600 dark:text-gray-300">
+              {scanFrames.length} directional images captured.
+              Review the individual obstruction estimates in
+              the scanner above.
+            </p>
+          </div>
 
-          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
             {scanFrames.map((frame) => (
               <article
                 key={`${frame.azimuth}-${frame.capturedAt}`}
@@ -188,138 +172,35 @@ export default function RecommendationsPage() {
               >
                 <Image
                   src={frame.imageDataUrl}
-                  alt={`Captured skyline at azimuth ${frame.azimuth.toFixed(0)} degrees`}
+                  alt={`Skyline at ${frame.azimuth.toFixed(0)} degrees`}
                   className="aspect-video w-full object-cover"
                   width={640}
                   height={360}
                   unoptimized
                 />
 
-                <p className="p-2 text-sm">
-                  {frame.azimuth.toFixed(0)}° azimuth
-                </p>
+                <div className="p-2">
+                  <p className="text-sm font-medium">
+                    {frame.azimuth.toFixed(0)}°
+                  </p>
+
+                  {frame.obstruction && (
+                    <p className="text-xs text-gray-500">
+                      {frame.obstruction.obstructionPercent}% image obstruction
+                    </p>
+                  )}
+                </div>
               </article>
             ))}
           </div>
         </section>
       )}
-      <section className="space-y-4">
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <h2 className="text-xl font-semibold">Current sky map</h2>
 
-          <span className="text-sm text-gray-500">
-            {now ? `${recommendations.length} targets` : "Calculating..."}
-          </span>
-        </div>
-
-        {now ? (
-          <SkyMap targets={skyMapTargets} location={location} date={now} />
-        ) : (
-          <p className="rounded-xl border p-5">
-            Calculating current sky conditions...
-          </p>
-        )}
-      </section>
-
-      <section className="space-y-4">
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <h2 className="text-xl font-semibold">Recommended targets</h2>
-
-          <span className="text-sm text-gray-500">
-            {now ? `${recommendations.length} objects` : "Calculating..."}
-          </span>
-        </div>
-
-        {!now ? (
-          <p className="rounded-xl border p-5">
-            Calculating current sky conditions...
-          </p>
-        ) : recommendations.length === 0 ? (
-          <p className="rounded-xl border p-5">
-            No catalog targets are currently recommended under your modeled
-            observing conditions. Try refreshing later or adjusting your
-            observing settings.
-          </p>
-        ) : (
-          recommendations.map((recommendation, index) => (
-            <article
-              key={recommendation.object.id}
-              className="rounded-xl border p-5"
-            >
-              <div className="flex flex-wrap items-start justify-between gap-3">
-                <div>
-                  <p className="text-sm text-gray-500">
-                    Rank #{index + 1} · {recommendation.object.type}
-                  </p>
-
-                  <h3 className="text-lg font-semibold">
-                    {recommendation.object.name}
-                  </h3>
-                </div>
-
-                <div className="text-right">
-                  <p className="text-2xl font-bold">
-                    {recommendation.score}/100
-                  </p>
-
-                  <p className="text-xs text-gray-500">
-                    Estimated observing score
-                  </p>
-                </div>
-              </div>
-
-              <div className="mt-3 h-2 overflow-hidden rounded-full bg-gray-200 dark:bg-gray-700">
-                <div
-                  className="h-full rounded-full bg-blue-600"
-                  style={{
-                    width: `${Math.max(
-                      0,
-                      Math.min(100, recommendation.score),
-                    )}%`,
-                  }}
-                />
-              </div>
-
-              <div className="mt-4 grid grid-cols-2 gap-3 text-sm">
-                <p>
-                  Altitude:{" "}
-                  <strong>
-                    {recommendation.object.position.altitude.toFixed(1)}°
-                  </strong>
-                </p>
-
-                <p>
-                  Azimuth:{" "}
-                  <strong>
-                    {recommendation.object.position.azimuth.toFixed(1)}°
-                  </strong>
-                </p>
-              </div>
-
-              <div className="mt-4">
-                <h4 className="text-sm font-semibold">Observing conditions</h4>
-
-                <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-gray-600 dark:text-gray-300">
-                  {recommendation.reasons.map((reason, reasonIndex) => (
-                    <li key={`${recommendation.object.id}-${reasonIndex}`}>
-                      {reason}
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            </article>
-          ))
-        )}
-      </section>
-
-      <footer className="border-t pt-4 text-sm text-gray-500">
-        <p>
-          Observing coordinates: {location.latitude.toFixed(4)}°,{" "}
-          {location.longitude.toFixed(4)}°. Elevation: {location.elevation ?? 0}{" "}
-          m. Horizon profile:{" "}
-          {horizon.points.length === 0 ? "unobstructed" : "customized"}. Scores
-          are preliminary estimates, not guarantees of visibility.
-        </p>
+      <footer className="border-t pt-4 text-xs text-gray-500">
+        Your horizon profile currently contains{" "}
+        {horizon.points.length} manually defined points.
+        Scanner estimates and manually entered values are
+        not yet automatically merged into the horizon profile.
       </footer>
     </main>
   );

@@ -2,6 +2,7 @@
 import type { Metadata, Viewport } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import AppNavigation from "@/components/AppNavigation";
+import { ObservatoryProvider } from "@/context/ObservatoryContext";
 import "./globals.css";
 
 const geistSans = Geist({
@@ -35,8 +36,10 @@ export default function RootLayout({
       className={`${geistSans.variable} ${geistMono.variable} min-h-full antialiased`}
     >
       <body className="min-h-screen flex flex-col">
-        <AppNavigation />
-        {children}
+        <ObservatoryProvider>
+          <AppNavigation />
+          {children}
+        </ObservatoryProvider>
       </body>
     </html>
   );
