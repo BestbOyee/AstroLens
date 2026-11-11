@@ -1,9 +1,7 @@
-
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { segmentSky } from "@/lib/skySegmentation"; // Uses a trained machine-learning model.
-
+import { segmentSky } from "@/lib/skySegmentation";
 
 export interface ObstructionAnalysis {
   obstructionPercent: number;
@@ -13,12 +11,8 @@ export interface ObstructionAnalysis {
   detectedColumnsPercent: number;
   status: "estimated" | "low-confidence";
   method: "on-device-heuristic" | "segformer";
-  boundaryProfile?: Array<{
-    xPercent: number;
-    yPercent: number;
-  }>;
+  boundaryProfile?: Array<{ xPercent: number; yPercent: number }>;
 }
-
 
 export interface HorizonScanFrame {
   azimuth: number;
@@ -35,6 +29,12 @@ interface HorizonScannerProps {
   onCancel?: () => void;
 }
 
+interface AnalysisTask {
+  sector: number;
+  frame: HorizonScanFrame;
+  generation: number;
+}
+
 const SECTOR_COUNT = 24;
 const SECTOR_SIZE = 360 / SECTOR_COUNT;
 const IMAGE_WIDTH = 640;
@@ -44,8 +44,7 @@ const ANALYSIS_HEIGHT = 135;
 const STABLE_HEADING_MS = 700;
 const HEADING_TOLERANCE_DEGREES = 4;
 
-// This is only an assumed vertical field of view. It is not calibrated
-// to the device's actual camera lens or image stabilization/crop.
+// This is an uncalibrated image-relative estimate, not a true horizon altitude.
 const ASSUMED_VERTICAL_FOV_DEGREES = 60;
 
 function normalizeAzimuth(value: number): number {
@@ -105,42 +104,17 @@ function getHeading(event: DeviceOrientationEvent): {
   return null;
 }
 
-/**
- * Heuristic sky classifier.
- *
- * This does not use a trained machine-learning model. It recognizes some
- * common blue-sky and bright, low-saturation sky colors. Clouds, haze,
- * sunsets, night scenes, snow, glass, and brightly lit objects can fool it.
- */
-
-/**
- * Heuristic sky classifier.
- *
- * This is not a trained model. It recognizes common blue sky, pale blue
- * sky, and bright neutral sky/cloud colors. Night scenes, sunsets, haze,
- * snow, glass, and unusually colored objects can still cause errors.
- */
-
-function isLikelySkyPixel(
-  r: number,
-  g: number,
-  b: number,
-): boolean {
+function isLikelySkyPixel(r: number, g: number, b: number): boolean {
   const max = Math.max(r, g, b);
   const min = Math.min(r, g, b);
   const brightness = (r + g + b) / 3;
   const saturation = max - min;
 
   const blueSky =
-    b > 65 &&
-    b >= r * 1.08 &&
-    b >= g * 0.94 &&
-    b - r >= 8;
+    b > 65 && b >= r * 1.08 && b >= g * 0.94 && b - r >= 8;
 
   const brightNeutralSky =
-    brightness > 165 &&
-    saturation < 38 &&
-    b >= r * 0.95;
+    brightness > 165 && saturation < 38 && b >= r * 0.95;
 
   const paleBlueSky =
     brightness > 125 &&
@@ -149,56 +123,20 @@ function isLikelySkyPixel(
     b - r >= 5 &&
     saturation < 75;
 
-  // Warm orange and pink sunset colors.
-  // The channel differences help distinguish warm sky from
-  // gray concrete and dark brown terrain.
   const warmSky =
-    brightness > 120 &&
-    r > 150 &&
-    r - g >= 35 &&
-    g - b >= 20;
+    brightness > 120 && r > 150 && r - g >= 35 && g - b >= 20;
 
   return blueSky || brightNeutralSky || paleBlueSky || warmSky;
 }
 
-
-/**
- * Calculates the median of a list of numbers.
- * The median is less sensitive to isolated trees, antennas, and other
- * narrow objects than a simple average.
- */
 function median(values: number[]): number {
   if (values.length === 0) return 0;
-
   const sorted = [...values].sort((a, b) => a - b);
   const middle = Math.floor(sorted.length / 2);
-
-  if (sorted.length % 2 === 0) {
-    return (sorted[middle - 1] + sorted[middle]) / 2;
-  }
-
-  return sorted[middle];
+  return sorted.length % 2 === 0
+    ? (sorted[middle - 1] + sorted[middle]) / 2
+    : sorted[middle];
 }
-
-/**
- * Estimates the foreground boundary using vertical image samples.
- *
- * A column is considered usable only when a sufficient proportion of
- * its top pixels look like sky. This prevents a column that begins
- * inside a tree or building from automatically being counted as a
- * detected skyline.
- *
- * Columns with verified sky but no detected foreground are treated as
- * open sky. Their boundary is placed at the bottom of the image.
- *
- * obstructionPercent is an image-space estimate, not a measurement
- * of real-world terrain obstruction.
- *
- * estimatedSkylineAngleDegrees is only an approximate image-relative
- * angle based on an assumed vertical field of view. It is not a
- * calibrated altitude above the astronomical horizon.
- */
-
 
 export function analyzeImagePixels(
   pixels: Uint8ClampedArray,
@@ -206,22 +144,15 @@ export function analyzeImagePixels(
   height: number,
 ): ObstructionAnalysis {
   const boundaries: number[] = [];
-
-  const boundaryProfile: Array<{
-    xPercent: number;
-    yPercent: number;
-  }> = [];
-
+  const boundaryProfile: Array<{ xPercent: number; yPercent: number }> = [];
   const totalSampledColumns = Math.floor(width / 2);
 
   for (let x = 1; x < width; x += 2) {
     let consecutiveNonSky = 0;
     let detectedBoundary = -1;
 
-    // Scan downward through this column, looking for foreground.
     for (let y = 0; y < height; y += 1) {
       const index = (y * width + x) * 4;
-
       const r = pixels[index];
       const g = pixels[index + 1];
       const b = pixels[index + 2];
@@ -230,8 +161,6 @@ export function analyzeImagePixels(
         consecutiveNonSky = 0;
       } else {
         consecutiveNonSky += 1;
-
-        // Require three consecutive non-sky pixels to reduce noise.
         if (consecutiveNonSky >= 3) {
           detectedBoundary = y - 2;
           break;
@@ -239,15 +168,9 @@ export function analyzeImagePixels(
       }
     }
 
-    // Preserve the detected point rather than discarding its position.
     if (detectedBoundary >= 0) {
-      const clampedBoundary = Math.max(
-        0,
-        Math.min(height, detectedBoundary),
-      );
-
+      const clampedBoundary = Math.max(0, Math.min(height, detectedBoundary));
       boundaries.push(clampedBoundary);
-
       boundaryProfile.push({
         xPercent: (x / (width - 1)) * 100,
         yPercent: (clampedBoundary / height) * 100,
@@ -260,65 +183,41 @@ export function analyzeImagePixels(
       ? (boundaries.length / totalSampledColumns) * 100
       : 0;
 
-  // Insufficient detections: retain available points but do not
-  // claim that the overall obstruction estimate is reliable.
   if (boundaries.length < totalSampledColumns * 0.15) {
     return {
       obstructionPercent: 0,
       skylineYPercent: 100,
       estimatedSkylineAngleDegrees: null,
-      confidencePercent: Math.round(
-        Math.min(30, detectedColumnsPercent * 0.3),
-      ),
-      detectedColumnsPercent: Math.round(
-        detectedColumnsPercent,
-      ),
+      confidencePercent: Math.round(Math.min(30, detectedColumnsPercent * 0.3)),
+      detectedColumnsPercent: Math.round(detectedColumnsPercent),
       status: "low-confidence",
       method: "on-device-heuristic",
       boundaryProfile,
     };
   }
 
-  // Keep the existing average measurement for compatibility.
+  // Median smoothing limits the influence of isolated branches and antennas.
+  const smoothedBoundaries = boundaries.map((value, index) => {
+    const start = Math.max(0, index - 2);
+    const end = Math.min(boundaries.length, index + 3);
+    return median(boundaries.slice(start, end));
+  });
+
   const meanBoundary =
-    boundaries.reduce((sum, value) => sum + value, 0) /
-    boundaries.length;
+    smoothedBoundaries.reduce((sum, value) => sum + value, 0) /
+    smoothedBoundaries.length;
 
-  const skylineYPercent =
-    (meanBoundary / height) * 100;
-
+  const skylineYPercent = (meanBoundary / height) * 100;
   const obstructionPercent = 100 - skylineYPercent;
-
-  // Approximate image-relative angle using the existing assumed
-  // vertical field of view. This is not calibrated altitude.
-  const normalizedDisplacement =
-    0.5 - meanBoundary / height;
-
   const estimatedSkylineAngleDegrees =
-    normalizedDisplacement *
-    ASSUMED_VERTICAL_FOV_DEGREES;
+    (0.5 - meanBoundary / height) * ASSUMED_VERTICAL_FOV_DEGREES;
 
-  // Confidence reflects detection coverage, not verified accuracy.
-  const coverageConfidence = Math.min(
-    100,
-    detectedColumnsPercent,
-  );
-
+  const coverageConfidence = Math.min(100, detectedColumnsPercent);
   const skyFraction = skylineYPercent / 100;
-
   const plausibleSceneFactor =
-    skyFraction > 0.03 && skyFraction < 0.98
-      ? 1
-      : 0.55;
-
+    skyFraction > 0.03 && skyFraction < 0.98 ? 1 : 0.55;
   const confidencePercent = Math.round(
-    Math.max(
-      0,
-      Math.min(
-        100,
-        coverageConfidence * plausibleSceneFactor,
-      ),
-    ),
+    Math.max(0, Math.min(100, coverageConfidence * plausibleSceneFactor)),
   );
 
   return {
@@ -327,24 +226,26 @@ export function analyzeImagePixels(
     estimatedSkylineAngleDegrees:
       Math.round(estimatedSkylineAngleDegrees * 10) / 10,
     confidencePercent,
-    detectedColumnsPercent: Math.round(
-      detectedColumnsPercent,
-    ),
-    status:
-      confidencePercent >= 60
-        ? "estimated"
-        : "low-confidence",
+    detectedColumnsPercent: Math.round(detectedColumnsPercent),
+    status: confidencePercent >= 60 ? "estimated" : "low-confidence",
     method: "on-device-heuristic",
     boundaryProfile,
   };
 }
 
+function lowConfidenceAnalysis(): ObstructionAnalysis {
+  return {
+    obstructionPercent: 0,
+    skylineYPercent: 100,
+    estimatedSkylineAngleDegrees: null,
+    confidencePercent: 0,
+    detectedColumnsPercent: 0,
+    status: "low-confidence",
+    method: "on-device-heuristic",
+  };
+}
 
-
-
-function analyzeCanvas(
-  sourceCanvas: HTMLCanvasElement,
-): ObstructionAnalysis {
+function analyzeCanvas(sourceCanvas: HTMLCanvasElement): ObstructionAnalysis {
   const analysisCanvas = document.createElement("canvas");
   analysisCanvas.width = ANALYSIS_WIDTH;
   analysisCanvas.height = ANALYSIS_HEIGHT;
@@ -353,25 +254,9 @@ function analyzeCanvas(
     willReadFrequently: true,
   });
 
-  if (!context) {
-    return {
-      obstructionPercent: 0,
-      skylineYPercent: 100,
-      estimatedSkylineAngleDegrees: null,
-      confidencePercent: 0,
-      detectedColumnsPercent: 0,
-      status: "low-confidence",
-      method: "on-device-heuristic",
-    };
-  }
+  if (!context) return lowConfidenceAnalysis();
 
-  context.drawImage(
-    sourceCanvas,
-    0,
-    0,
-    ANALYSIS_WIDTH,
-    ANALYSIS_HEIGHT,
-  );
+  context.drawImage(sourceCanvas, 0, 0, ANALYSIS_WIDTH, ANALYSIS_HEIGHT);
 
   try {
     const imageData = context.getImageData(
@@ -380,44 +265,54 @@ function analyzeCanvas(
       ANALYSIS_WIDTH,
       ANALYSIS_HEIGHT,
     );
-
     return analyzeImagePixels(
       imageData.data,
       ANALYSIS_WIDTH,
       ANALYSIS_HEIGHT,
     );
   } catch {
-    // Browsers can deny pixel reads in some circumstances.
-    return {
-      obstructionPercent: 0,
-      skylineYPercent: 100,
-      estimatedSkylineAngleDegrees: null,
-      confidencePercent: 0,
-      detectedColumnsPercent: 0,
-      status: "low-confidence",
-      method: "on-device-heuristic",
-    };
+    return lowConfidenceAnalysis();
   }
 }
+
+async function analyzeImageDataUrlHeuristic(
+  imageDataUrl: string,
+): Promise<ObstructionAnalysis> {
+  try {
+    const image = new Image();
+    image.src = imageDataUrl;
+    await new Promise<void>((resolve, reject) => {
+      image.onload = () => resolve();
+      image.onerror = () => reject(new Error("Could not load captured image."));
+    });
+
+    const canvas = document.createElement("canvas");
+    canvas.width = IMAGE_WIDTH;
+    canvas.height = IMAGE_HEIGHT;
+    const context = canvas.getContext("2d", { willReadFrequently: true });
+    if (!context) return lowConfidenceAnalysis();
+
+    context.drawImage(image, 0, 0, IMAGE_WIDTH, IMAGE_HEIGHT);
+    return analyzeCanvas(canvas);
+  } catch {
+    return lowConfidenceAnalysis();
+  }
+}
+
 async function analyzeWithSegmentation(
   imageDataUrl: string,
-  fallbackCanvas: HTMLCanvasElement,
 ): Promise<ObstructionAnalysis> {
   try {
     const result = await segmentSky(imageDataUrl);
-
     const points = result.boundaryProfile;
 
     if (points.length < 2) {
-      return analyzeCanvas(fallbackCanvas);
+      return analyzeImageDataUrlHeuristic(imageDataUrl);
     }
 
     const meanBoundary =
-      points.reduce((sum, point) => sum + point.yPercent, 0) /
-      points.length;
-
+      points.reduce((sum, point) => sum + point.yPercent, 0) / points.length;
     const obstructionPercent = 100 - meanBoundary;
-
     const detectedColumnsPercent = Math.min(
       100,
       (points.length / Math.ceil(result.width / 2)) * 100,
@@ -426,38 +321,30 @@ async function analyzeWithSegmentation(
     return {
       obstructionPercent: Math.round(obstructionPercent),
       skylineYPercent: Math.round(meanBoundary),
-      estimatedSkylineAngleDegrees: Math.round(
-        ((50 - meanBoundary) / 100) *
-          ASSUMED_VERTICAL_FOV_DEGREES *
-          10,
-      ) / 10,
+      estimatedSkylineAngleDegrees:
+        Math.round(
+          ((50 - meanBoundary) / 100) *
+            ASSUMED_VERTICAL_FOV_DEGREES *
+            10,
+        ) / 10,
       confidencePercent: Math.round(detectedColumnsPercent),
       detectedColumnsPercent: Math.round(detectedColumnsPercent),
-      status:
-        detectedColumnsPercent >= 15
-          ? "estimated"
-          : "low-confidence",
+      status: detectedColumnsPercent >= 15 ? "estimated" : "low-confidence",
       method: "segformer",
       boundaryProfile: points,
     };
   } catch (error) {
-    console.warn(
-      "Segmentation failed; using heuristic fallback:",
-      error,
-    );
-
-    return analyzeCanvas(fallbackCanvas);
+    console.warn("Segmentation failed; using heuristic fallback:", error);
+    return analyzeImageDataUrlHeuristic(imageDataUrl);
   }
 }
+
 function formatAngle(value: number | null): string {
   return value === null ? "Unavailable" : `~${value.toFixed(1)}°`;
 }
 
 function getObstructionLabel(analysis?: ObstructionAnalysis): string {
-  if (!analysis || analysis.status === "low-confidence") {
-    return "Uncertain";
-  }
-
+  if (!analysis || analysis.status === "low-confidence") return "Uncertain";
   if (analysis.obstructionPercent < 20) return "Low";
   if (analysis.obstructionPercent < 45) return "Moderate";
   if (analysis.obstructionPercent < 70) return "High";
@@ -481,6 +368,12 @@ export default function HorizonScanner({
   const onScanCompleteRef = useRef(onScanComplete);
   const captureInProgressRef = useRef(false);
 
+  // SegFormer work is queued separately from capture, so image capture does
+  // not wait for model inference before allowing the next sector.
+  const analysisQueueRef = useRef<AnalysisTask[]>([]);
+  const analysisWorkerRef = useRef(false);
+  const scanGenerationRef = useRef(0);
+
   const [cameraReady, setCameraReady] = useState(false);
   const [scanning, setScanning] = useState(false);
   const [heading, setHeading] = useState<number | null>(null);
@@ -490,6 +383,7 @@ export default function HorizonScanner({
     "compass" | "estimated" | null
   >(null);
   const [frames, setFrames] = useState<HorizonScanFrame[]>([]);
+  const [processingSectors, setProcessingSectors] = useState<number[]>([]);
   const [currentSector, setCurrentSector] = useState<number | null>(null);
   const [selectedSector, setSelectedSector] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -505,10 +399,7 @@ export default function HorizonScanner({
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
 
-    if (videoRef.current) {
-      videoRef.current.srcObject = null;
-    }
-
+    if (videoRef.current) videoRef.current.srcObject = null;
     setCameraReady(false);
   }, []);
 
@@ -560,7 +451,6 @@ export default function HorizonScanner({
           "Could not start the camera. Check browser permissions and try again.",
         );
       }
-
       return false;
     }
   }, []);
@@ -586,7 +476,6 @@ export default function HorizonScanner({
 
       if (typeof OrientationConstructor.requestPermission === "function") {
         const permission = await OrientationConstructor.requestPermission();
-
         if (permission !== "granted") {
           setError(
             "Motion permission was not granted. Enable it in your browser settings to use the guided scan.",
@@ -607,7 +496,75 @@ export default function HorizonScanner({
     }
   }, []);
 
-  const captureFrame = useCallback(async () => {
+  const processAnalysisQueue = useCallback(async () => {
+    if (analysisWorkerRef.current) return;
+    analysisWorkerRef.current = true;
+
+    try {
+      while (analysisQueueRef.current.length > 0) {
+        const task = analysisQueueRef.current.shift();
+        if (!task) continue;
+
+        try {
+          const obstruction = await analyzeWithSegmentation(
+            task.frame.imageDataUrl,
+          );
+
+          // Ignore results from an old scan or an image that has since been
+          // replaced by a newer capture in the same sector.
+          if (task.generation === scanGenerationRef.current) {
+            const latestFrame = framesRef.current.get(task.sector);
+            if (latestFrame?.capturedAt === task.frame.capturedAt) {
+              const analyzedFrame = { ...latestFrame, obstruction };
+              framesRef.current.set(task.sector, analyzedFrame);
+              setFrames(
+                Array.from(framesRef.current.values()).sort(
+                  (a, b) => a.azimuth - b.azimuth,
+                ),
+              );
+            }
+          }
+        } catch (analysisError) {
+          console.error("Image analysis failed:", analysisError);
+
+          if (task.generation === scanGenerationRef.current) {
+            const latestFrame = framesRef.current.get(task.sector);
+            if (latestFrame?.capturedAt === task.frame.capturedAt) {
+              const analyzedFrame = {
+                ...latestFrame,
+                obstruction: lowConfidenceAnalysis(),
+              };
+              framesRef.current.set(task.sector, analyzedFrame);
+              setFrames(
+                Array.from(framesRef.current.values()).sort(
+                  (a, b) => a.azimuth - b.azimuth,
+                ),
+              );
+            }
+          }
+        } finally {
+          setProcessingSectors((current) => {
+            const anotherTaskForSector = analysisQueueRef.current.some(
+              (queued) =>
+                queued.sector === task.sector &&
+                queued.generation === scanGenerationRef.current,
+            );
+            return anotherTaskForSector
+              ? current
+              : current.filter((sector) => sector !== task.sector);
+          });
+        }
+      }
+    } finally {
+      analysisWorkerRef.current = false;
+
+      // The queue is checked again on every loop iteration. JavaScript
+      // cannot interleave another capture between the final check and this
+      // synchronous cleanup, so no queued task is stranded here.
+    }
+  }, []);
+
+  const captureFrame = useCallback(() => {
     if (captureInProgressRef.current) return;
 
     const video = videoRef.current;
@@ -615,9 +572,7 @@ export default function HorizonScanner({
     const orientation = latestOrientationRef.current;
 
     if (!video || !canvas || !orientation) {
-      setMessage(
-        "Waiting for a usable compass heading before capturing.",
-      );
+      setMessage("Waiting for a usable compass heading before capturing.");
       return;
     }
 
@@ -626,10 +581,7 @@ export default function HorizonScanner({
       return;
     }
 
-    const context = canvas.getContext("2d", {
-      willReadFrequently: true,
-    });
-
+    const context = canvas.getContext("2d");
     if (!context) {
       setError("Could not initialize image capture.");
       return;
@@ -637,7 +589,6 @@ export default function HorizonScanner({
 
     const sourceWidth = video.videoWidth;
     const sourceHeight = video.videoHeight;
-
     if (!sourceWidth || !sourceHeight) {
       setMessage("The camera has not produced an image yet.");
       return;
@@ -651,7 +602,6 @@ export default function HorizonScanner({
 
       const targetRatio = IMAGE_WIDTH / IMAGE_HEIGHT;
       const sourceRatio = sourceWidth / sourceHeight;
-
       let sx = 0;
       let sy = 0;
       let sw = sourceWidth;
@@ -677,14 +627,8 @@ export default function HorizonScanner({
         IMAGE_HEIGHT,
       );
 
-      // Both capture and analysis happen locally in the browser.
       const imageDataUrl = canvas.toDataURL("image/jpeg", 0.7);
-      const obstruction = await analyzeWithSegmentation(
-        imageDataUrl,
-        canvas,
-      );
       const sector = getSector(orientation.azimuth);
-
       const frame: HorizonScanFrame = {
         azimuth: orientation.azimuth,
         pitch: orientation.pitch,
@@ -692,36 +636,38 @@ export default function HorizonScanner({
         imageDataUrl,
         capturedAt: new Date().toISOString(),
         headingSource: orientation.source,
-        obstruction,
       };
 
-      // Keep the newest image and its analysis in each 15-degree sector.
       framesRef.current.set(sector, frame);
-
-      const updatedFrames = Array.from(
-        framesRef.current.values(),
-      ).sort((a, b) => a.azimuth - b.azimuth);
-
-      setFrames(updatedFrames);
-
-      
-      const confidenceNote =
-        obstruction.status === "estimated"
-          ? `Estimated obstruction: ${obstruction.obstructionPercent}%. Confidence ${obstruction.confidencePercent}%.`
-          : `Obstruction estimate unavailable. Low confidence (${obstruction.confidencePercent}%). Review or recapture this image if possible.`;
-
-        setMessage(
-        `Captured and analyzed sector ${sector + 1}/24 (${Math.round(orientation.azimuth)}°, ${getDirection(orientation.azimuth)}). ${confidenceNote}`,
-        );
-
-    } catch {
-      setError(
-        "Could not capture or analyze this image. Try capturing the direction again.",
+      setFrames(
+        Array.from(framesRef.current.values()).sort(
+          (a, b) => a.azimuth - b.azimuth,
+        ),
       );
+
+      analysisQueueRef.current.push({
+        sector,
+        frame,
+        generation: scanGenerationRef.current,
+      });
+      setProcessingSectors((current) =>
+        current.includes(sector) ? current : [...current, sector],
+      );
+
+      setMessage(
+        `Captured sector ${sector + 1}/24 (${Math.round(
+          orientation.azimuth,
+        )}°, ${getDirection(orientation.azimuth)}). Image analysis is running in the background; you can continue scanning.`,
+      );
+
+      void processAnalysisQueue();
+    } catch {
+      setError("Could not capture this image. Try capturing the direction again.");
     } finally {
+      // The lock protects only the quick camera-to-image copy, not AI analysis.
       captureInProgressRef.current = false;
     }
-  }, []);
+  }, [processAnalysisQueue]);
 
   useEffect(() => {
     if (!scanning) return;
@@ -742,10 +688,8 @@ export default function HorizonScanner({
       }
 
       const nowMs = Date.now();
-      const nextPitch =
-        typeof event.beta === "number" ? event.beta : null;
-      const nextRoll =
-        typeof event.gamma === "number" ? event.gamma : null;
+      const nextPitch = typeof event.beta === "number" ? event.beta : null;
+      const nextRoll = typeof event.gamma === "number" ? event.gamma : null;
 
       latestOrientationRef.current = {
         azimuth: result.azimuth,
@@ -766,9 +710,10 @@ export default function HorizonScanner({
         lastSeenSector = sector;
         stableSince = nowMs;
         previousHeading = result.azimuth;
-
         setMessage(
-          `Facing sector ${sector + 1}/24 (${getDirection(result.azimuth)}). Hold steady briefly to capture and analyze it.`,
+          `Facing sector ${sector + 1}/24 (${getDirection(
+            result.azimuth,
+          )}). Hold steady briefly to capture it.`,
         );
       } else if (
         previousHeading === null ||
@@ -780,9 +725,7 @@ export default function HorizonScanner({
       }
 
       const headingIsStable =
-        stableSince > 0 &&
-        nowMs - stableSince >= STABLE_HEADING_MS;
-
+        stableSince > 0 && nowMs - stableSince >= STABLE_HEADING_MS;
       const sectorIsMissing = !framesRef.current.has(sector);
       const selectedTargetMatches =
         selectedSector === null || selectedSector === sector;
@@ -799,19 +742,14 @@ export default function HorizonScanner({
     };
 
     window.addEventListener("deviceorientation", handleOrientation);
-
     return () => {
-      window.removeEventListener(
-        "deviceorientation",
-        handleOrientation,
-      );
+      window.removeEventListener("deviceorientation", handleOrientation);
     };
   }, [scanning, captureFrame, selectedSector]);
 
   const startScan = async () => {
     setError(null);
 
-    // Invoke both permission APIs directly from the user's button action.
     const [sensorsEnabled, cameraStarted] = await Promise.all([
       enableSensors(),
       startCamera(),
@@ -822,11 +760,14 @@ export default function HorizonScanner({
       return;
     }
 
+    scanGenerationRef.current += 1;
+    analysisQueueRef.current = [];
     framesRef.current.clear();
     latestOrientationRef.current = null;
     captureInProgressRef.current = false;
 
     setFrames([]);
+    setProcessingSectors([]);
     setHeading(null);
     setPitch(null);
     setRoll(null);
@@ -834,20 +775,18 @@ export default function HorizonScanner({
     setCurrentSector(null);
     setSelectedSector(null);
     setMessage(
-      "Start facing north, then rotate clockwise slowly. Pause in each 15-degree sector to capture and analyze the full 360-degree horizon.",
+      "Start facing north, then rotate clockwise slowly. Pause in each 15-degree sector. Captures are saved immediately and analyzed in the background.",
     );
     setScanning(true);
   };
 
   const finishScan = () => {
-    const capturedFrames = Array.from(
-      framesRef.current.values(),
-    ).sort((a, b) => a.azimuth - b.azimuth);
+    const capturedFrames = Array.from(framesRef.current.values()).sort(
+      (a, b) => a.azimuth - b.azimuth,
+    );
 
-    const missing = Array.from(
-      { length: SECTOR_COUNT },
-      (_, sector) => sector,
-    ).filter((sector) => !framesRef.current.has(sector));
+    const missing = Array.from({ length: SECTOR_COUNT }, (_, sector) => sector)
+      .filter((sector) => !framesRef.current.has(sector));
 
     if (missing.length > 0) {
       setError(
@@ -861,12 +800,27 @@ export default function HorizonScanner({
       return;
     }
 
+    const pendingAnalysis = capturedFrames.some((frame) => !frame.obstruction);
+    if (
+      pendingAnalysis ||
+      analysisQueueRef.current.length > 0 ||
+      analysisWorkerRef.current
+    ) {
+      setError(
+        "All images are captured, but some are still being analyzed. Wait for the analysis queue to finish before completing the scan.",
+      );
+      return;
+    }
+
     setScanning(false);
     stopCamera();
     onScanCompleteRef.current(capturedFrames);
   };
 
   const cancelScan = () => {
+    scanGenerationRef.current += 1;
+    analysisQueueRef.current = [];
+    setProcessingSectors([]);
     setScanning(false);
     stopCamera();
     framesRef.current.clear();
@@ -883,14 +837,15 @@ export default function HorizonScanner({
 
   useEffect(() => {
     return () => {
+      scanGenerationRef.current += 1;
       streamRef.current?.getTracks().forEach((track) => track.stop());
     };
   }, []);
 
   const capturedCount = frames.length;
-  const coverage = Math.round(
-    (capturedCount / SECTOR_COUNT) * 100,
-  );
+  const coverage = Math.round((capturedCount / SECTOR_COUNT) * 100);
+  const analyzedCount = frames.filter((frame) => frame.obstruction).length;
+  const pendingCount = processingSectors.length;
 
   const nextMissingSector = Array.from(
     { length: SECTOR_COUNT },
@@ -900,8 +855,7 @@ export default function HorizonScanner({
   const guidedTarget =
     selectedSector !== null
       ? selectedSector
-      : currentSector !== null &&
-          !framesRef.current.has(currentSector)
+      : currentSector !== null && !framesRef.current.has(currentSector)
         ? currentSector
         : nextMissingSector ?? currentSector;
 
@@ -911,23 +865,29 @@ export default function HorizonScanner({
     }
 
     if (selectedSector !== null) {
-      if (currentSector === selectedSector) {
-        return `You are pointing toward sector ${selectedSector + 1}. Pause, then tap “Capture this direction” to analyze it.`;
-      }
-
-      return `Rotate slowly toward sector ${selectedSector + 1} (${Math.round(sectorCenter(selectedSector))}°).`;
+      return currentSector === selectedSector
+        ? `You are pointing toward sector ${
+            selectedSector + 1
+          }. Pause, then tap “Capture this direction”.`
+        : `Rotate slowly toward sector ${selectedSector + 1} (${Math.round(
+            sectorCenter(selectedSector),
+          )}°).`;
     }
 
     if (capturedCount === SECTOR_COUNT) {
-      return "All 24 sectors are captured and analyzed. Review the estimates before finishing.";
+      return pendingCount > 0
+        ? "All sectors are captured. Wait for the remaining image analyses."
+        : "All 24 sectors are captured and analyzed. Review the estimates before finishing.";
     }
 
     if (currentSector === guidedTarget) {
-      return `You are pointing toward sector ${currentSector + 1}. Pause briefly so AstroLens can capture and analyze it.`;
+      return `You are pointing toward sector ${currentSector + 1}. Pause briefly to capture it.`;
     }
 
     return guidedTarget !== null
-      ? `Rotate clockwise toward sector ${guidedTarget + 1} (${Math.round(sectorCenter(guidedTarget))}°). Keep the skyline visible.`
+      ? `Rotate clockwise toward sector ${guidedTarget + 1} (${Math.round(
+          sectorCenter(guidedTarget),
+        )}°). Keep the skyline visible.`
       : "Rotate slowly to review the horizon.";
   })();
 
@@ -948,19 +908,17 @@ export default function HorizonScanner({
   ).length;
 
   return (
-    <section className="space-y-4 rounded-xl border p-4 sm:p-5">
+    <section className="space-y-4 rounded-xl border p-3 sm:space-y-5 sm:p-5">
       <div>
-        <p className="text-sm font-medium uppercase tracking-widest text-blue-500">
+        <p className="text-xs font-medium uppercase tracking-widest text-blue-500 sm:text-sm">
           AstroLens · 24-sector horizon scan
         </p>
-        <h2 className="mt-1 text-xl font-semibold">
-          Scan your surroundings
-        </h2>
+        <h2 className="mt-1 text-xl font-semibold">Scan your surroundings</h2>
         <p className="mt-2 text-sm text-gray-600 dark:text-gray-300">
-          Hold your phone vertically and capture the skyline through a full
-          360-degree rotation. Each image is analyzed locally to estimate
-          foreground obstruction and skyline position. Daylight scans usually
-          work better with this initial image-processing method.
+          Hold your phone vertically and rotate through a full 360 degrees.
+          Each image is saved immediately and analyzed locally in the
+          background, so you do not need to wait for the AI model between
+          directions.
         </p>
       </div>
 
@@ -970,7 +928,7 @@ export default function HorizonScanner({
           autoPlay
           muted
           playsInline
-          className="aspect-video w-full object-cover"
+          className="aspect-[4/3] w-full object-cover sm:aspect-video"
           aria-label="Live camera preview for the horizon scan"
         />
 
@@ -981,12 +939,11 @@ export default function HorizonScanner({
         )}
 
         {cameraReady && heading !== null && (
-          <div className="absolute bottom-3 left-3 right-3 flex items-center gap-3 rounded-2xl border border-white/20 bg-black/75 p-3 text-white shadow-lg backdrop-blur-md">
-            <div className="relative h-20 w-20 shrink-0">
+          <div className="absolute bottom-2 left-2 right-2 flex items-center gap-2 rounded-xl border border-white/20 bg-black/75 p-2 text-white shadow-lg backdrop-blur-md sm:bottom-3 sm:left-3 sm:right-3 sm:gap-3 sm:rounded-2xl sm:p-3">
+            <div className="relative h-16 w-16 shrink-0 sm:h-20 sm:w-20">
               <div className="absolute left-1/2 top-0 z-10 -translate-x-1/2">
                 <div className="h-0 w-0 border-x-[7px] border-b-[11px] border-x-transparent border-b-cyan-400" />
               </div>
-
               <div
                 className="absolute inset-1 rounded-full border border-white/40 transition-transform duration-150"
                 style={{ transform: `rotate(${-heading}deg)` }}
@@ -994,17 +951,14 @@ export default function HorizonScanner({
                 {["N", "NE", "E", "SE", "S", "SW", "W", "NW"].map(
                   (label, index) => {
                     const angle = index * 45;
-
                     return (
                       <span
                         key={label}
-                        className={`absolute left-1/2 top-1/2 text-xs font-semibold ${
-                          label === "N"
-                            ? "text-cyan-300"
-                            : "text-white/90"
+                        className={`absolute left-1/2 top-1/2 text-[10px] font-semibold sm:text-xs ${
+                          label === "N" ? "text-cyan-300" : "text-white/90"
                         }`}
                         style={{
-                          transform: `translate(-50%, -50%) rotate(${angle}deg) translateY(-29px) rotate(${-angle}deg)`,
+                          transform: `translate(-50%, -50%) rotate(${angle}deg) translateY(-24px) rotate(${-angle}deg)`,
                         }}
                       >
                         {label}
@@ -1012,22 +966,21 @@ export default function HorizonScanner({
                     );
                   },
                 )}
-
                 <div className="absolute left-1/2 top-1/2 h-2 w-2 -translate-x-1/2 -translate-y-1/2 rounded-full bg-cyan-400" />
               </div>
             </div>
 
             <div className="min-w-0">
-              <p className="text-xs uppercase tracking-widest text-white/60">
+              <p className="text-[10px] uppercase tracking-widest text-white/60 sm:text-xs">
                 Currently facing
               </p>
-              <p className="mt-1 text-3xl font-semibold tracking-tight">
+              <p className="mt-1 text-2xl font-semibold tracking-tight sm:text-3xl">
                 {getDirection(heading)}
-                <span className="ml-2 text-lg font-normal text-cyan-300">
+                <span className="ml-2 text-base font-normal text-cyan-300 sm:text-lg">
                   {Math.round(heading)}°
                 </span>
               </p>
-              <p className="mt-1 text-xs text-white/70">
+              <p className="mt-1 text-[10px] text-white/70 sm:text-xs">
                 {headingSource === "compass"
                   ? "Compass heading"
                   : "Estimated heading"}
@@ -1039,38 +992,44 @@ export default function HorizonScanner({
 
       <canvas ref={canvasRef} className="hidden" />
 
-      <div className="grid grid-cols-3 gap-2">
-        <div className="rounded-lg bg-gray-50 p-3 dark:bg-gray-900">
-          <p className="text-xs text-gray-500">Heading</p>
-          <p className="mt-1 font-semibold tabular-nums">
-            {heading === null ? "—" : `${heading.toFixed(0)}°`}
-          </p>
+      <details className="rounded-lg border px-3 py-2">
+        <summary className="cursor-pointer py-1 text-sm font-medium">
+          Technical sensor readings
+        </summary>
+        <div className="mt-3 grid grid-cols-3 gap-2">
+          <div className="rounded-lg bg-gray-50 p-2 dark:bg-gray-900 sm:p-3">
+            <p className="text-xs text-gray-500">Heading</p>
+            <p className="mt-1 font-semibold tabular-nums">
+              {heading === null ? "—" : `${heading.toFixed(0)}°`}
+            </p>
+          </div>
+          <div className="rounded-lg bg-gray-50 p-2 dark:bg-gray-900 sm:p-3">
+            <p className="text-xs text-gray-500">Pitch</p>
+            <p className="mt-1 font-semibold tabular-nums">
+              {pitch === null ? "—" : `${pitch.toFixed(0)}°`}
+            </p>
+          </div>
+          <div className="rounded-lg bg-gray-50 p-2 dark:bg-gray-900 sm:p-3">
+            <p className="text-xs text-gray-500">Roll</p>
+            <p className="mt-1 font-semibold tabular-nums">
+              {roll === null ? "—" : `${roll.toFixed(0)}°`}
+            </p>
+          </div>
         </div>
+      </details>
 
-        <div className="rounded-lg bg-gray-50 p-3 dark:bg-gray-900">
-          <p className="text-xs text-gray-500">Pitch</p>
-          <p className="mt-1 font-semibold tabular-nums">
-            {pitch === null ? "—" : `${pitch.toFixed(0)}°`}
-          </p>
-        </div>
-
-        <div className="rounded-lg bg-gray-50 p-3 dark:bg-gray-900">
-          <p className="text-xs text-gray-500">Roll</p>
-          <p className="mt-1 font-semibold tabular-nums">
-            {roll === null ? "—" : `${roll.toFixed(0)}°`}
-          </p>
-        </div>
-      </div>
-
-      <div className="rounded-xl border border-blue-200 bg-blue-50 p-4 dark:border-blue-900 dark:bg-blue-950">
+      <div className="rounded-xl border border-blue-200 bg-blue-50 p-3 dark:border-blue-900 dark:bg-blue-950 sm:p-4">
         <p className="text-sm font-medium text-blue-800 dark:text-blue-200">
           {capturedCount === SECTOR_COUNT
-            ? "All 24 sectors captured and analyzed"
+            ? pendingCount > 0
+              ? `All sectors captured · ${pendingCount} analyses pending`
+              : "All 24 sectors captured and analyzed"
             : guidedTarget !== null
-              ? `Next target: sector ${guidedTarget + 1}/24 · ${Math.round(sectorCenter(guidedTarget))}°`
+              ? `Next target: sector ${guidedTarget + 1}/24 · ${Math.round(
+                  sectorCenter(guidedTarget),
+                )}°`
               : "Waiting for compass heading"}
         </p>
-
         <p className="mt-1 text-sm text-gray-700 dark:text-gray-200">
           {turnInstruction}
         </p>
@@ -1086,7 +1045,7 @@ export default function HorizonScanner({
           <button
             type="button"
             onClick={() => setSelectedSector(null)}
-            className="mt-3 min-h-11 rounded-lg border border-blue-300 px-3 py-2 text-sm dark:border-blue-700"
+            className="mt-3 min-h-10 rounded-lg border border-blue-300 px-3 py-2 text-sm dark:border-blue-700"
           >
             Return to automatic guidance
           </button>
@@ -1094,13 +1053,12 @@ export default function HorizonScanner({
       </div>
 
       <div className="space-y-2">
-        <div className="flex items-center justify-between text-sm">
+        <div className="flex items-center justify-between gap-2 text-sm">
           <span className="font-medium">Scan coverage</span>
           <span className="tabular-nums">
-            {capturedCount}/24 sectors · {coverage}%
+            {capturedCount}/24 · {coverage}%
           </span>
         </div>
-
         <div
           className="h-2 overflow-hidden rounded-full bg-gray-200 dark:bg-gray-700"
           role="progressbar"
@@ -1115,11 +1073,14 @@ export default function HorizonScanner({
           />
         </div>
 
-        <div className="grid grid-cols-4 gap-2 sm:grid-cols-6 lg:grid-cols-8">
+        <div className="grid grid-cols-6 gap-1.5 sm:gap-2">
           {Array.from({ length: SECTOR_COUNT }, (_, sector) => {
-            const frame = framesRef.current.get(sector);
+            const frame = frames.find(
+              (item) => getSector(item.azimuth) === sector,
+            );
             const captured = Boolean(frame);
             const analysis = frame?.obstruction;
+            const isProcessing = processingSectors.includes(sector);
             const isCurrent = currentSector === sector;
             const isTarget = guidedTarget === sector;
             const center = sectorCenter(sector);
@@ -1132,38 +1093,52 @@ export default function HorizonScanner({
                   setSelectedSector(sector);
                   setError(null);
                   setMessage(
-                    `Sector ${sector + 1} selected (${Math.round(center)}°). Point the camera toward this heading, then capture it to update its obstruction estimate.`,
+                    `Sector ${sector + 1} selected (${Math.round(
+                      center,
+                    )}°). Point the camera toward this heading, then capture it to update its estimate.`,
                   );
                 }}
                 aria-pressed={isTarget}
-                aria-label={`Sector ${sector + 1}, ${Math.round(center)} degrees, ${
-                  captured ? "captured" : "missing"
+                aria-label={`Sector ${sector + 1}, ${Math.round(
+                  center,
+                )} degrees, ${
+                  isProcessing
+                    ? "analysis pending"
+                    : captured
+                      ? "captured"
+                      : "missing"
                 }`}
-                className={`min-h-14 rounded-lg border p-2 text-sm transition ${
-                  captured
-                    ? analysis?.status === "low-confidence"
-                      ? "border-amber-500 bg-amber-50 text-amber-900 dark:bg-amber-950 dark:text-amber-200"
-                      : "border-green-600 bg-green-50 text-green-800 dark:bg-green-950 dark:text-green-200"
-                    : isTarget
-                      ? "border-blue-600 bg-blue-50 text-blue-800 dark:bg-blue-950 dark:text-blue-200"
-                      : "border-gray-300 dark:border-gray-700"
+                className={`min-h-[62px] rounded-lg border p-1 text-center text-xs transition sm:min-h-14 sm:p-2 sm:text-sm ${
+                  isProcessing
+                    ? "border-blue-500 bg-blue-50 text-blue-900 dark:bg-blue-950 dark:text-blue-200"
+                    : captured
+                      ? analysis?.status === "low-confidence"
+                        ? "border-amber-500 bg-amber-50 text-amber-900 dark:bg-amber-950 dark:text-amber-200"
+                        : "border-green-600 bg-green-50 text-green-800 dark:bg-green-950 dark:text-green-200"
+                      : isTarget
+                        ? "border-blue-600 bg-blue-50 text-blue-800 dark:bg-blue-950 dark:text-blue-200"
+                        : "border-gray-300 dark:border-gray-700"
                 }`}
               >
                 <span className="block font-semibold">
                   {String(sector + 1).padStart(2, "0")}
                 </span>
-                <span className="block text-xs">
-                  {Math.round(center)}° · {getDirection(center)}
+                <span className="block text-[10px] sm:text-xs">
+                  {Math.round(center)}° {getDirection(center)}
                 </span>
-                <span className="block text-xs">
-                  {captured
-                    ? `${analysis?.obstructionPercent ?? "—"}% blocked`
-                    : isCurrent
-                      ? "Here"
-                      : "Missing"}
+                <span className="block text-[10px] sm:text-xs">
+                  {isProcessing
+                    ? "Analyzing…"
+                    : captured
+                      ? `${analysis?.obstructionPercent ?? "—"}% blocked`
+                      : isCurrent
+                        ? "Here"
+                        : "Missing"}
                 </span>
                 {captured && analysis?.status === "low-confidence" && (
-                  <span className="block text-xs">Check estimate</span>
+                  <span className="block text-[10px] sm:text-xs">
+                    Check result
+                  </span>
                 )}
               </button>
             );
@@ -1171,55 +1146,46 @@ export default function HorizonScanner({
         </div>
 
         <p className="text-xs text-gray-500">
-          Green sectors have an estimate; amber sectors have low-confidence
-          results. Select any sector to target or recapture it. All 24 sectors
-          are required to finish.
+          Blue sectors are being analyzed; green sectors have an estimate;
+          amber sectors have low-confidence results. Select any sector to
+          target or recapture it. All 24 sectors are required.
         </p>
       </div>
 
-      <section className="space-y-3 rounded-xl border p-4">
+      <section className="space-y-3 rounded-xl border p-3 sm:p-4">
         <div>
           <h3 className="font-semibold">Obstruction analysis</h3>
           <p className="mt-1 text-xs text-gray-500">
-            On-device heuristic estimates from captured images. Results are
-            not calibrated astronomical horizon altitudes.
+            SegFormer analyzes each saved image in the background. The
+            heuristic is used only if segmentation fails or returns too few
+            boundary points.
           </p>
         </div>
 
-        <div className="grid grid-cols-2 gap-3">
+        <div className="grid grid-cols-2 gap-2 sm:gap-3">
           <div className="rounded-lg bg-gray-50 p-3 dark:bg-gray-900">
-            <p className="text-xs text-gray-500">
-              Mean image obstruction
-            </p>
+            <p className="text-xs text-gray-500">Mean image obstruction</p>
             <p className="mt-1 text-2xl font-semibold tabular-nums">
-              {averageObstruction === null
-                ? "—"
-                : `${averageObstruction}%`}
+              {averageObstruction === null ? "—" : `${averageObstruction}%`}
             </p>
             <p className="mt-1 text-xs text-gray-500">
-              Across {analyzedFrames.length} analyzed sectors
+              Across {analyzedCount} analyzed sectors
             </p>
           </div>
-
           <div className="rounded-lg bg-gray-50 p-3 dark:bg-gray-900">
-            <p className="text-xs text-gray-500">
-              Low-confidence sectors
-            </p>
+            <p className="text-xs text-gray-500">Analysis remaining</p>
             <p className="mt-1 text-2xl font-semibold tabular-nums">
-              {lowConfidenceCount}
+              {pendingCount}
             </p>
             <p className="mt-1 text-xs text-gray-500">
-              May need recapturing
+              {lowConfidenceCount} low-confidence results
             </p>
           </div>
         </div>
 
         {analyzedFrames.length > 0 && (
           <div className="space-y-2">
-            <p className="text-sm font-medium">
-              Captured sector estimates
-            </p>
-
+            <p className="text-sm font-medium">Captured sector estimates</p>
             {analyzedFrames
               .slice()
               .sort((a, b) => a.azimuth - b.azimuth)
@@ -1232,27 +1198,25 @@ export default function HorizonScanner({
                     key={`${sector}-${frame.capturedAt}`}
                     className="rounded-lg border p-3"
                   >
-                    <div className="flex items-center justify-between gap-3">
-                      <div>
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
                         <p className="text-sm font-medium">
                           Sector {String(sector + 1).padStart(2, "0")} ·{" "}
                           {Math.round(frame.azimuth)}° ·{" "}
                           {getDirection(frame.azimuth)}
                         </p>
                         <p className="mt-1 text-xs text-gray-500">
-                        {getObstructionLabel(analysis)} obstruction ·{" "}
-                        {analysis.confidencePercent}% confidence
-                      </p>
-
-                      <p className="mt-1 text-xs text-gray-500">
-                        Detection method:{" "}
-                        {analysis.method === "segformer"
-                          ? "SegFormer AI segmentation"
-                          : "Heuristic fallback"}
-                      </p>
+                          {getObstructionLabel(analysis)} obstruction ·{" "}
+                          {analysis.confidencePercent}% confidence
+                        </p>
+                        <p className="mt-1 text-xs text-gray-500">
+                          Method:{" "}
+                          {analysis.method === "segformer"
+                            ? "SegFormer AI segmentation"
+                            : "Heuristic fallback"}
+                        </p>
                       </div>
-
-                      <p className="text-lg font-semibold tabular-nums">
+                      <p className="shrink-0 text-lg font-semibold tabular-nums">
                         {analysis.obstructionPercent}%
                       </p>
                     </div>
@@ -1270,16 +1234,14 @@ export default function HorizonScanner({
                       />
                     </div>
 
-                    <div className="mt-2 grid grid-cols-2 gap-2 text-xs text-gray-500">
+                    <div className="mt-2 grid grid-cols-1 gap-1 text-xs text-gray-500 sm:grid-cols-2 sm:gap-2">
                       <p>
                         Skyline position: {analysis.skylineYPercent}% down
                         from image top
                       </p>
                       <p>
                         Approx. image-relative angle:{" "}
-                        {formatAngle(
-                          analysis.estimatedSkylineAngleDegrees,
-                        )}
+                        {formatAngle(analysis.estimatedSkylineAngleDegrees)}
                       </p>
                     </div>
 
@@ -1297,15 +1259,15 @@ export default function HorizonScanner({
 
         {analyzedFrames.length === 0 && (
           <p className="text-sm text-gray-500">
-            Obstruction estimates will appear here as you capture sectors.
+            Obstruction estimates will appear here as images finish processing.
           </p>
         )}
 
         <p className="text-xs text-gray-500">
-          The obstruction percentage estimates the portion of the image below
-          the detected boundary. The skyline position is measured in image
+          Obstruction percentage estimates the portion of the image below the
+          detected boundary. Skyline position is measured in image
           coordinates. The angle assumes a 60° vertical field of view and is
-          only a rough image-relative estimate. Neither value is a calibrated
+          only a rough image-relative estimate; it is not a calibrated
           altitude above the astronomical horizon.
         </p>
       </section>
@@ -1326,12 +1288,12 @@ export default function HorizonScanner({
         </p>
       )}
 
-      <div className="flex flex-wrap gap-2">
+      <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap">
         {!scanning ? (
           <button
             type="button"
             onClick={startScan}
-            className="min-h-11 rounded-lg bg-blue-600 px-4 py-2 text-white hover:bg-blue-700"
+            className="min-h-12 w-full rounded-xl bg-blue-600 px-5 py-3 text-base font-semibold text-white shadow-lg hover:bg-blue-700 sm:w-auto"
           >
             Start 360° scan
           </button>
@@ -1340,17 +1302,21 @@ export default function HorizonScanner({
             <button
               type="button"
               onClick={captureFrame}
-              className="min-h-11 rounded-lg border px-4 py-2 hover:bg-gray-100 dark:hover:bg-gray-800"
+              className="min-h-14 w-full rounded-xl bg-blue-600 px-5 py-3 text-base font-semibold text-white shadow-lg hover:bg-blue-700 sm:w-auto"
             >
               Capture this direction
             </button>
-
             <button
               type="button"
               onClick={finishScan}
-              className="min-h-11 rounded-lg bg-blue-600 px-4 py-2 text-white hover:bg-blue-700"
+              disabled={
+                capturedCount !== SECTOR_COUNT ||
+                pendingCount > 0 ||
+                analyzedCount !== SECTOR_COUNT
+              }
+              className="min-h-12 w-full rounded-xl border px-4 py-3 text-sm font-medium hover:bg-gray-100 disabled:cursor-not-allowed disabled:opacity-50 dark:hover:bg-gray-800 sm:w-auto"
             >
-              Finish scan
+              {pendingCount > 0 ? `Analyzing ${pendingCount}…` : "Finish scan"}
             </button>
           </>
         )}
@@ -1358,18 +1324,19 @@ export default function HorizonScanner({
         <button
           type="button"
           onClick={cancelScan}
-          className="min-h-11 rounded-lg border px-4 py-2 hover:bg-gray-100 dark:hover:bg-gray-800"
+          className="min-h-12 w-full rounded-xl border px-4 py-3 text-sm font-medium hover:bg-gray-100 dark:hover:bg-gray-800 sm:w-auto"
         >
           Cancel
         </button>
       </div>
 
       <p className="text-xs text-gray-500">
-        Images and analysis are processed locally in the browser. This
-        heuristic is an initial prototype, not a trained sky-segmentation
-        model. Night scenes, clouds, haze, sunsets, and unusual foreground
-        colors can produce inaccurate estimates. Images and measurements
-        remain in browser memory unless the parent component saves them.
+        Images and analysis are processed locally in the browser. Night
+        scenes, clouds, haze, sunsets, and unusual foreground colors can
+        produce inaccurate estimates. Device pitch and roll are recorded as
+        sensor readings; they are not used as calibrated camera angles.
+        Images and measurements remain in browser memory unless the parent
+        component saves them.
       </p>
     </section>
   );
