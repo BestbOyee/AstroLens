@@ -2,10 +2,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import {
-  analyzeImagePixels,
-  type ObstructionAnalysis,
-} from "../../components/HorizonScanner";
+import { segmentSky, type SkySegmentation } from "../../lib/skySegmentation";
 
 const TEST_IMAGES = [
   { name: "Trees and buildings", file: "trees-buildings.jpg" },
@@ -18,147 +15,206 @@ const TEST_IMAGES = [
 type TestResult = {
   name: string;
   src: string;
-  analysis: ObstructionAnalysis | null;
+  segmentation: SkySegmentation | null;
+  maskUrl: string | null;
   error: string | null;
+  status: "waiting" | "loading" | "complete" | "error";
 };
 
-const ANALYSIS_WIDTH = 240;
-const ANALYSIS_HEIGHT = 135;
+function createMaskUrl(segmentation: SkySegmentation): string {
+  const canvas = document.createElement("canvas");
+  canvas.width = segmentation.width;
+  canvas.height = segmentation.height;
+
+  const context = canvas.getContext("2d");
+
+  if (!context) {
+    throw new Error("Could not create mask canvas.");
+  }
+
+  const imageData = context.createImageData(
+    segmentation.width,
+    segmentation.height,
+  );
+
+  for (let i = 0; i < segmentation.skyMask.length; i++) {
+    const offset = i * 4;
+
+    if (segmentation.skyMask[i] === 1) {
+      imageData.data[offset] = 0;
+      imageData.data[offset + 1] = 220;
+      imageData.data[offset + 2] = 255;
+      imageData.data[offset + 3] = 125;
+    } else {
+      imageData.data[offset] = 0;
+      imageData.data[offset + 1] = 0;
+      imageData.data[offset + 2] = 0;
+      imageData.data[offset + 3] = 0;
+    }
+  }
+
+  context.putImageData(imageData, 0, 0);
+
+  return canvas.toDataURL("image/png");
+}
 
 export default function TestHorizonPage() {
   const [results, setResults] = useState<TestResult[]>(
     TEST_IMAGES.map((image) => ({
       name: image.name,
       src: `/test-images/${image.file}`,
-      analysis: null,
+      segmentation: null,
+      maskUrl: null,
       error: null,
+      status: "waiting",
     })),
   );
+
+  const [progress, setProgress] = useState(0);
+  const [modelStatus, setModelStatus] = useState("Waiting to initialize");
 
   useEffect(() => {
     let cancelled = false;
 
-    async function analyzeImages() {
-      const updated = await Promise.all(
-        TEST_IMAGES.map(
-          (image) =>
-            new Promise<TestResult>((resolve) => {
-              const src = `/test-images/${image.file}`;
-              const img = new Image();
+    async function runBenchmark() {
+      setModelStatus("Loading segmentation model...");
 
-              img.onload = () => {
-                try {
-                  const canvas = document.createElement("canvas");
-                  canvas.width = ANALYSIS_WIDTH;
-                  canvas.height = ANALYSIS_HEIGHT;
+      for (let i = 0; i < TEST_IMAGES.length; i++) {
+        if (cancelled) return;
 
-                  const context = canvas.getContext("2d", {
-                    willReadFrequently: true,
-                  });
+        const image = TEST_IMAGES[i];
+        const src = `/test-images/${image.file}`;
 
-                  if (!context) {
-                    throw new Error("Could not create canvas context.");
-                  }
+        setResults((previous) =>
+          previous.map((item, index) =>
+            index === i ? { ...item, status: "loading" } : item,
+          ),
+        );
 
-                  context.drawImage(
-                    img,
-                    0,
-                    0,
-                    ANALYSIS_WIDTH,
-                    ANALYSIS_HEIGHT,
-                  );
+        setModelStatus(`Analyzing ${image.name}...`);
 
-                  const pixels = context.getImageData(
-                    0,
-                    0,
-                    ANALYSIS_WIDTH,
-                    ANALYSIS_HEIGHT,
-                  );
+        try {
+          const segmentation = await segmentSky(src);
 
-                  const analysis = analyzeImagePixels(
-                    pixels.data,
-                    ANALYSIS_WIDTH,
-                    ANALYSIS_HEIGHT,
-                  );
+          if (cancelled) return;
 
-                  resolve({
-                    name: image.name,
-                    src,
-                    analysis,
+          const maskUrl = createMaskUrl(segmentation);
+
+          setResults((previous) =>
+            previous.map((item, index) =>
+              index === i
+                ? {
+                    ...item,
+                    segmentation,
+                    maskUrl,
                     error: null,
-                  });
-                } catch (error) {
-                  resolve({
-                    name: image.name,
-                    src,
-                    analysis: null,
-                    error:
-                      error instanceof Error
-                        ? error.message
-                        : "Image analysis failed.",
-                  });
-                }
-              };
+                    status: "complete",
+                  }
+                : item,
+            ),
+          );
+        } catch (error) {
+          if (cancelled) return;
 
-              img.onerror = () => {
-                resolve({
-                  name: image.name,
-                  src,
-                  analysis: null,
-                  error: `Could not load ${image.file}. Check the filename and folder.`,
-                });
-              };
+          const message =
+            error instanceof Error
+              ? error.message
+              : "Unknown segmentation error.";
 
-              img.src = src;
-            }),
-        ),
-      );
+          setResults((previous) =>
+            previous.map((item, index) =>
+              index === i
+                ? {
+                    ...item,
+                    error: message,
+                    status: "error",
+                  }
+                : item,
+            ),
+          );
+        }
+
+        setProgress(i + 1);
+      }
 
       if (!cancelled) {
-        setResults(updated);
+        setModelStatus("Benchmark complete");
       }
     }
 
-    void analyzeImages();
+    void runBenchmark();
 
     return () => {
       cancelled = true;
     };
   }, []);
 
-  const completed = results.filter((item) => item.analysis !== null);
-  const confident = completed.filter(
-    (item) => item.analysis?.status === "estimated",
-  );
-  const uncertain = completed.length - confident.length;
-  const failed = results.filter((item) => item.error !== null);
+  const completed = results.filter(
+    (item) => item.status === "complete",
+  ).length;
+
+  const failed = results.filter(
+    (item) => item.status === "error",
+  ).length;
 
   return (
     <main className="mx-auto max-w-6xl space-y-6 p-5 sm:p-8">
       <header className="space-y-2">
         <p className="text-sm font-medium uppercase tracking-widest text-sky-600">
-          AstroLens · Developer Test
+          AstroLens · Machine Learning Test
         </p>
+
         <h1 className="text-3xl font-bold">
-          Real-Photo Skyline Benchmark
+          Semantic Skyline Segmentation
         </h1>
+
         <p className="max-w-3xl text-sm text-gray-600">
-          Runs the existing on-device color heuristic on five photographs.
-          The horizontal line represents the detector&apos;s mean estimated
-          boundary, not a pixel-by-pixel skyline trace.
+          SegFormer identifies sky pixels in each photograph.
+          AstroLens then extracts a boundary from the resulting
+          segmentation mask.
         </p>
       </header>
 
-      <section className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-        <Summary label="Images loaded" value={`${completed.length}/5`} />
-        <Summary label="Confident estimates" value={String(confident.length)} />
-        <Summary label="Low confidence" value={String(uncertain)} />
-        <Summary label="Load or analysis errors" value={String(failed.length)} />
+      <section className="rounded-xl border border-gray-200 p-4 space-y-3">
+        <div className="flex items-center justify-between gap-3">
+          <h2 className="font-semibold">Model progress</h2>
+          <span className="text-sm text-gray-500">
+            {progress}/5 images
+          </span>
+        </div>
+
+        <div className="h-2 overflow-hidden rounded-full bg-gray-200">
+          <div
+            className="h-full rounded-full bg-sky-500 transition-all"
+            style={{ width: `${(progress / 5) * 100}%` }}
+          />
+        </div>
+
+        <p className="text-sm text-gray-600">{modelStatus}</p>
+
+        <div className="grid grid-cols-3 gap-3 text-sm">
+          <Summary label="Completed" value={String(completed)} />
+          <Summary label="Failed" value={String(failed)} />
+          <Summary label="Remaining" value={String(5 - completed - failed)} />
+        </div>
+      </section>
+
+      <section className="flex flex-wrap gap-4 text-xs text-gray-600">
+        <span className="flex items-center gap-2">
+          <span className="h-3 w-3 rounded-sm bg-cyan-400" />
+          Model-detected sky
+        </span>
+
+        <span className="flex items-center gap-2">
+          <span className="h-0.5 w-5 bg-red-500" />
+          Extracted boundary
+        </span>
       </section>
 
       <div className="grid gap-6 md:grid-cols-2">
         {results.map((item) => {
-          const analysis = item.analysis;
+          const segmentation = item.segmentation;
+          const points = segmentation?.boundaryProfile ?? [];
 
           return (
             <article
@@ -174,113 +230,92 @@ export default function TestHorizonPage() {
                 <img
                   src={item.src}
                   alt={item.name}
-                  className="h-full w-full object-fill"
+                  className="absolute inset-0 h-full w-full object-fill"
                 />
-                      {analysis && (
-            <p className="absolute bottom-2 left-2 z-20 rounded bg-black px-2 py-1 text-xs text-white">
-              Status: {analysis.status} · Boundary points:{" "}
-              {analysis.boundaryProfile?.length ?? 0}
-            </p>
-          )}
-                
-                  
-              {analysis?.status === "estimated" &&
-                analysis.boundaryProfile &&
-                analysis.boundaryProfile.length >= 2 && (
+
+                {item.maskUrl && (
+                  <img
+                    src={item.maskUrl}
+                    alt="Model sky segmentation mask"
+                    className="absolute inset-0 h-full w-full object-fill"
+                  />
+                )}
+
+                {points.length >= 2 && (
                   <svg
-                    className="absolute inset-0 z-10 h-full w-full"
+                    className="pointer-events-none absolute inset-0 h-full w-full"
                     viewBox="0 0 100 100"
                     preserveAspectRatio="none"
-                    aria-label="Detected skyline boundary"
                   >
                     <polyline
-                      points={analysis.boundaryProfile
+                      points={points
                         .map(
                           (point) =>
                             `${point.xPercent},${point.yPercent}`,
                         )
                         .join(" ")}
                       fill="none"
-                      stroke="#ff0000"
-                      strokeWidth="0.6"
+                      stroke="#ff3030"
+                      strokeWidth="0.8"
                       strokeLinejoin="round"
                       strokeLinecap="round"
+                      vectorEffect="non-scaling-stroke"
                     />
                   </svg>
                 )}
 
-
-
-                {item.error && (
-                  <div className="absolute inset-0 flex items-center justify-center p-4 text-center text-sm text-red-700">
-                    {item.error}
+                {item.status === "loading" && (
+                  <div className="absolute inset-0 flex items-center justify-center bg-black/60 text-sm text-white">
+                    Running segmentation...
                   </div>
                 )}
 
-                {!analysis && !item.error && (
-                  <div className="absolute inset-0 flex items-center justify-center text-sm text-gray-600">
-                    Analyzing image…
+                {item.status === "waiting" && (
+                  <div className="absolute inset-0 flex items-center justify-center bg-black/50 text-sm text-white">
+                    Waiting...
+                  </div>
+                )}
+
+                {item.status === "error" && (
+                  <div className="absolute inset-0 flex items-center justify-center bg-black/80 p-4 text-center text-sm text-red-300">
+                    {item.error}
                   </div>
                 )}
               </div>
 
               <div className="space-y-2 p-4 text-sm">
-                {analysis ? (
+                <Metric
+                  label="Segmentation status"
+                  value={item.status}
+                />
+
+                {segmentation && (
                   <>
                     <Metric
-                      label="Result"
-                      value={
-                        analysis.status === "estimated"
-                          ? "Estimate available"
-                          : "Low confidence"
-                      }
-                    />
-                    
-                    <Metric
-                      label="Estimated obstruction"
-                      value={
-                        analysis.status === "estimated"
-                          ? `${analysis.obstructionPercent}%`
-                          : "Unavailable — low confidence"
-                      }
-                    />
-
-                    
-                    <Metric
-                      label="Mean boundary from image top"
-                      value={
-                        analysis.status === "estimated"
-                          ? `${analysis.skylineYPercent}%`
-                          : "Unavailable — low confidence"
-                      }
+                      label="Sky coverage"
+                      value={`${segmentation.skyCoveragePercent}%`}
                     />
 
                     <Metric
-                      label="Detected columns"
-                      value={`${analysis.detectedColumnsPercent}%`}
+                      label="Boundary points"
+                      value={String(points.length)}
                     />
+
                     <Metric
-                      label="Confidence score"
-                      value={`${analysis.confidencePercent}%`}
+                      label="Mask dimensions"
+                      value={`${segmentation.width} × ${segmentation.height}`}
                     />
-                    <Metric
-                      label="Estimated image-relative angle"
-                      value={
-                        analysis.estimatedSkylineAngleDegrees === null
-                          ? "Unavailable"
-                          : `${analysis.estimatedSkylineAngleDegrees}°`
-                      }
-                    />
-                    <p className="pt-2 text-xs text-gray-500">
-                      Confidence measures detected boundaries, not whether
-                      the boundary is truly the skyline. Angle is approximate
-                      and uses an assumed camera field of view.
-                    </p>
                   </>
-                ) : (
-                  !item.error && (
-                    <p className="text-gray-500">Waiting for analysis…</p>
-                  )
+                )}
+
+                {item.error && (
+                  <p className="text-red-500">{item.error}</p>
+                )}
+
+                {segmentation && points.length < 2 && (
+                  <p className="text-amber-600">
+                    Not enough boundary points were found.
+                  </p>
                 )}
               </div>
             </article>
@@ -289,22 +324,23 @@ export default function TestHorizonPage() {
       </div>
 
       <section className="space-y-2 rounded-xl border border-gray-200 p-4">
-        <h2 className="font-semibold">What to check</h2>
+        <h2 className="font-semibold">Evaluation criteria</h2>
+
         <ul className="list-disc space-y-1 pl-5 text-sm text-gray-600">
           <li>
-            Does the red line roughly match where the sky meets trees or
-            buildings?
+            Does the cyan mask correctly identify the open sky?
           </li>
           <li>
-            Does the detector mistake clouds, bright concrete, or sunset
-            colors for sky?
+            Does it exclude reflective glass buildings?
           </li>
           <li>
-            Does it report low confidence when the boundary is unclear?
+            Does it distinguish tree canopies and branches from sky?
           </li>
           <li>
-            Does a high confidence score actually correspond to a correct
-            result?
+            Does the red line follow the actual sky-to-foreground boundary?
+          </li>
+          <li>
+            Does it handle sunset and twilight images?
           </li>
         </ul>
       </section>
@@ -312,16 +348,28 @@ export default function TestHorizonPage() {
   );
 }
 
-function Summary({ label, value }: { label: string; value: string }) {
+function Summary({
+  label,
+  value,
+}: {
+  label: string;
+  value: string;
+}) {
   return (
-    <div className="rounded-xl border border-gray-200 p-4">
+    <div className="rounded-lg bg-gray-100 p-3">
       <p className="text-xs text-gray-500">{label}</p>
-      <p className="mt-1 text-2xl font-semibold">{value}</p>
+      <p className="mt-1 text-xl font-semibold">{value}</p>
     </div>
   );
 }
 
-function Metric({ label, value }: { label: string; value: string }) {
+function Metric({
+  label,
+  value,
+}: {
+  label: string;
+  value: string;
+}) {
   return (
     <div className="flex items-start justify-between gap-3">
       <span className="text-gray-600">{label}</span>

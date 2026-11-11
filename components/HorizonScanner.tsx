@@ -2,6 +2,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { segmentSky } from "@/lib/skySegmentation"; // Uses a trained machine-learning model.
 
 
 export interface ObstructionAnalysis {
@@ -11,7 +12,7 @@ export interface ObstructionAnalysis {
   confidencePercent: number;
   detectedColumnsPercent: number;
   status: "estimated" | "low-confidence";
-  method: "on-device-heuristic";
+  method: "on-device-heuristic" | "segformer";
   boundaryProfile?: Array<{
     xPercent: number;
     yPercent: number;
@@ -398,7 +399,56 @@ function analyzeCanvas(
     };
   }
 }
+async function analyzeWithSegmentation(
+  imageDataUrl: string,
+  fallbackCanvas: HTMLCanvasElement,
+): Promise<ObstructionAnalysis> {
+  try {
+    const result = await segmentSky(imageDataUrl);
 
+    const points = result.boundaryProfile;
+
+    if (points.length < 2) {
+      return analyzeCanvas(fallbackCanvas);
+    }
+
+    const meanBoundary =
+      points.reduce((sum, point) => sum + point.yPercent, 0) /
+      points.length;
+
+    const obstructionPercent = 100 - meanBoundary;
+
+    const detectedColumnsPercent = Math.min(
+      100,
+      (points.length / Math.ceil(result.width / 2)) * 100,
+    );
+
+    return {
+      obstructionPercent: Math.round(obstructionPercent),
+      skylineYPercent: Math.round(meanBoundary),
+      estimatedSkylineAngleDegrees: Math.round(
+        ((50 - meanBoundary) / 100) *
+          ASSUMED_VERTICAL_FOV_DEGREES *
+          10,
+      ) / 10,
+      confidencePercent: Math.round(detectedColumnsPercent),
+      detectedColumnsPercent: Math.round(detectedColumnsPercent),
+      status:
+        detectedColumnsPercent >= 15
+          ? "estimated"
+          : "low-confidence",
+      method: "segformer",
+      boundaryProfile: points,
+    };
+  } catch (error) {
+    console.warn(
+      "Segmentation failed; using heuristic fallback:",
+      error,
+    );
+
+    return analyzeCanvas(fallbackCanvas);
+  }
+}
 function formatAngle(value: number | null): string {
   return value === null ? "Unavailable" : `~${value.toFixed(1)}°`;
 }
@@ -557,7 +607,7 @@ export default function HorizonScanner({
     }
   }, []);
 
-  const captureFrame = useCallback(() => {
+  const captureFrame = useCallback(async () => {
     if (captureInProgressRef.current) return;
 
     const video = videoRef.current;
@@ -629,7 +679,10 @@ export default function HorizonScanner({
 
       // Both capture and analysis happen locally in the browser.
       const imageDataUrl = canvas.toDataURL("image/jpeg", 0.7);
-      const obstruction = analyzeCanvas(canvas);
+      const obstruction = await analyzeWithSegmentation(
+        imageDataUrl,
+        canvas,
+      );
       const sector = getSector(orientation.azimuth);
 
       const frame: HorizonScanFrame = {
@@ -1187,9 +1240,16 @@ export default function HorizonScanner({
                           {getDirection(frame.azimuth)}
                         </p>
                         <p className="mt-1 text-xs text-gray-500">
-                          {getObstructionLabel(analysis)} obstruction ·{" "}
-                          {analysis.confidencePercent}% confidence
-                        </p>
+                        {getObstructionLabel(analysis)} obstruction ·{" "}
+                        {analysis.confidencePercent}% confidence
+                      </p>
+
+                      <p className="mt-1 text-xs text-gray-500">
+                        Detection method:{" "}
+                        {analysis.method === "segformer"
+                          ? "SegFormer AI segmentation"
+                          : "Heuristic fallback"}
+                      </p>
                       </div>
 
                       <p className="text-lg font-semibold tabular-nums">
