@@ -1,3 +1,4 @@
+
 @import "tailwindcss";
 
 :root {
@@ -19,18 +20,39 @@
   }
 }
 
+/* Consistent sizing across the application */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  min-height: 100%;
+  -webkit-text-size-adjust: 100%;
+  scroll-behavior: smooth;
+  scroll-padding-top: 5rem;
+}
+
 body {
+  min-height: 100vh;
+  min-width: 320px;
+  margin: 0;
   background: var(--background);
   color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: var(--font-geist-sans), Arial, Helvetica, sans-serif;
+  overflow-x: clip;
 }
 
-/* Mobile touch support */
-html {
-  -webkit-text-size-adjust: 100%;
-  touch-action: manipulation;
+/* Prevent media from exceeding narrow screens */
+img,
+video,
+canvas,
+svg {
+  max-width: 100%;
 }
 
+/* Touch interaction */
 button,
 [role="button"],
 a,
@@ -46,7 +68,30 @@ a {
   -webkit-tap-highlight-color: transparent;
 }
 
-@media (max-width: 768px) {
+button {
+  cursor: pointer;
+}
+
+/* Keyboard accessibility */
+:focus-visible {
+  outline: 2px solid #38bdf8;
+  outline-offset: 3px;
+}
+
+/* Mobile defaults */
+@media (max-width: 767px) {
+  html {
+    scroll-padding-top: 1rem;
+  }
+
+  body {
+    /*
+      Reserve room for the fixed bottom navigation,
+      including the iPhone safe area.
+    */
+    padding-bottom: calc(4rem + env(safe-area-inset-bottom));
+  }
+
   button,
   [role="button"] {
     min-height: 44px;
@@ -55,11 +100,27 @@ a {
   input,
   select,
   textarea {
+    min-height: 44px;
     font-size: 16px;
   }
 
   button,
   a {
     cursor: pointer;
+  }
+}
+
+/* Avoid forced smooth scrolling for users who disable animation */
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
   }
 }
