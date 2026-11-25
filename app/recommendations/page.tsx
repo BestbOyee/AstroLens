@@ -3,7 +3,7 @@
 
 import Image from "next/image";
 import { useState } from "react";
-
+import LocationSelector from "@/components/LocationSelector";
 import HorizonEditor from "@/components/HorizonEditor";
 import HorizonScanner, {
   type HorizonScanFrame,
@@ -11,18 +11,31 @@ import HorizonScanner, {
 import WeatherPanel from "@/components/WeatherPanel";
 import { useCurrentWeather } from "@/hooks/useCurrentWeather";
 import { useObservatory } from "@/context/ObservatoryContext";
-
+import HorizonScanReview from "@/components/HorizonScanReview";
+import { mergeReviewedHorizonMeasurements } from "@/lib/horizonScanIntegration";
 export default function RecommendationsPage() {
   const {
     location,
+    setLocation,
     horizon,
     setHorizon,
     bortleClass,
     setBortleClass,
-  } = useObservatory();
+  } = useObservatory(); 
 
   const [scanFrames, setScanFrames] = useState<HorizonScanFrame[]>([]);
-
+  {scanFrames.length > 0 && (
+    <HorizonScanReview
+      frames={scanFrames}
+      onSave={(measurements) => {
+        setHorizon(
+          mergeReviewedHorizonMeasurements(horizon, measurements)
+        );
+        setScanFrames([]);
+      }}
+      onDiscard={() => setScanFrames([])}
+    />
+  )}
   const {
     weather,
     loading: weatherLoading,
@@ -139,13 +152,17 @@ export default function RecommendationsPage() {
 
       <details className="rounded-xl border p-4">
         <summary className="cursor-pointer font-semibold">
-          Manually edit horizon obstructions
+          Change your observing location
         </summary>
 
         <div className="mt-4">
           <HorizonEditor
             profile={horizon}
             onChange={setHorizon}
+          />
+          <LocationSelector
+            location={location}
+            onChange={setLocation}
           />
         </div>
       </details>

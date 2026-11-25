@@ -89,11 +89,25 @@ export default function LocationSelector({
     field: keyof ObserverLocation,
     value: number
   ) {
+    // Ignore empty or invalid number input.
+    if (!Number.isFinite(value)) {
+      return;
+    }
+  
+    // Validate latitude and longitude ranges.
+    if (field === "latitude" && (value < -90 || value > 90)) {
+      return;
+    }
+  
+    if (field === "longitude" && (value < -180 || value > 180)) {
+      return;
+    }
+  
     onChange({
       ...location,
       [field]: value,
     });
-
+  
     setSelectedLocationId("");
   }
 
